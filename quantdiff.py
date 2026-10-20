@@ -28,7 +28,9 @@ Tensors only: tokenizer, chat template and config tampering are not covered.
 import argparse
 import http.client
 import json
+import os
 import re
+import shutil
 import struct
 import sys
 import threading
@@ -378,7 +380,7 @@ def check_plain(name, base_w, cand_w):
     return res
 
 
-def stream_units(units, budget, workers=8):
+def stream_units(units, budget, workers=8, on_submit=None):
     """Yield (unit, tensors) in order. Remote tensors are fetched ahead on a thread pool, at most `budget` bytes
     beyond the unit being checked (one request costs ~2 s of latency, so one at a time is slow)."""
     size = lambda u: sum(s.size(n) for s, n in u[1] if hasattr(s, "size"))  # noqa: E731
@@ -391,6 +393,8 @@ def stream_units(units, budget, workers=8):
         for i, u in enumerate(units):
             while nxt < len(units) and (nxt <= i or held + size(units[nxt]) <= budget):
                 pending[nxt] = [pool.submit(s.get, n) for s, n in units[nxt][1]]
+                if on_submit:
+                    on_submit(nxt)
                 held += size(units[nxt])
                 nxt += 1
             tensors = [f.result() for f in pending.pop(i)]
@@ -398,7 +402,7 @@ def stream_units(units, budget, workers=8):
             yield u, tensors
 
 
-def audit(base, cand, only=None, layers=None, include_global=False, prefetch_bytes=256 << 20):
+def audit(base, cand, only=None, layers=None, include_global=False, prefetch_bytes=256 << 20, progress=None):
     """`base` and `cand` are stores or directories. `layers` limits the check to those layer indices."""
     base = base if hasattr(base, "get") else Store(base)
     cand = cand if hasattr(cand, "get") else Store(cand)
@@ -428,8 +432,14 @@ def audit(base, cand, only=None, layers=None, include_global=False, prefetch_byt
             fetch += [(cand, stem + ".scales"), (cand, stem + ".biases")]
         units.append((target, fetch))
     results = []
-    for (target, fetch), tensors in stream_units(units, prefetch_bytes):
+    if progress:
+        progress.begin(units, (base, cand), layers)
+    for i, ((target, fetch), tensors) in enumerate(stream_units(units, prefetch_bytes, on_submit=progress and progress.submitted)):
         results.append(check_quant(target, *tensors) if len(tensors) == 4 else check_plain(target, *tensors))
+        if progress:
+            progress.done(i, results[-1])
+    if progress:
+        progress.finish()
     return Report(results, only_cand, sorted(n for n in base.names - matched if in_scope(n)),
                   None if layers is None else sorted(layers),
                   sum(getattr(s, "fetched", 0) for s in (base, cand)),
@@ -475,6 +485,125 @@ def render(rep, top=15):
     return "\n".join(out)
 
 
+GLYPHS = {"queued": "·", "fetching": "◐", "ok": "■", "flagged": "✗"}
+COLORS = {"queued": "2", "fetching": "33", "ok": "32", "flagged": "1;31"}
+
+
+def bar(frac, width=24):
+    n = round(max(0.0, min(1.0, frac)) * width)
+    return "█" * n + "░" * (width - n)
+
+
+def clock(seconds):
+    m, s = divmod(int(seconds), 60)
+    return f"{m // 60}:{m % 60:02d}:{s:02d}" if m >= 60 else f"{m}:{s:02d}"
+
+
+class Progress:
+    """Live terminal view: a byte bar, a tensor bar and one cell per tensor grouped by layer, redrawn in place."""
+
+    def __init__(self, out=None, color=None, width=None, labels=("", "")):
+        self.out = out or sys.stderr
+        self.color = (self.out.isatty() and "NO_COLOR" not in os.environ) if color is None else color
+        self.width, self.labels = width, labels
+        self.names, self.status, self.stores = [], [], ()
+        self.scope, self.planned, self.fetched0 = "all layers", 0, 0
+        self.latest = None  # (status, tensor name, note)
+        self.t0 = time.monotonic()
+        self.last_draw, self.drawn = 0.0, 0
+
+    def begin(self, units, stores, layers):
+        self.names, self.stores = [u[0] for u in units], stores
+        self.status = ["queued"] * len(units)
+        self.scope = "all layers" if layers is None else f"layers {sorted(layers)}"
+        self.fetched0 = sum(getattr(s, "fetched", 0) for s in stores)
+        self.planned = sum(s.size(n) for u in units for s, n in u[1] if hasattr(s, "size"))
+        self.t0 = time.monotonic()
+        self.draw(force=True)
+
+    def submitted(self, i):
+        if self.status[i] == "queued":
+            self.status[i] = "fetching"
+        self.draw()
+
+    def done(self, i, result):
+        self.status[i] = "flagged" if result.flagged else "ok"
+        self.latest = (self.status[i], result.name, "; ".join(result.reasons))
+        self.draw()
+
+    def finish(self):
+        self.draw(force=True)
+
+    def paint(self, code, text):
+        return f"\x1b[{code}m{text}\x1b[0m" if self.color else text
+
+    def cell(self, status):
+        return self.paint(COLORS[status], GLYPHS[status])
+
+    def grid(self, width):
+        groups = {}
+        for i, name in enumerate(self.names):
+            groups.setdefault(layer_of(name), []).append(i)
+        keys = sorted(groups, key=lambda k: (k is None, k))
+        block = 4 + max(len(v) for v in groups.values()) + 2
+        per_row = max(1, width // block)
+        rows = []
+        for r in range(0, len(keys), per_row):
+            line = ""
+            for k in keys[r : r + per_row]:
+                cells = "".join(self.cell(self.status[i]) for i in groups[k])
+                label = "glb" if k is None else str(k)
+                line += f"{label:>3} {cells}" + " " * (block - 4 - len(groups[k]))
+            rows.append(line.rstrip())
+        return rows
+
+    def lines(self):
+        w = (self.width or shutil.get_terminal_size((100, 24)).columns) - 1
+        fit = lambda text: text[:w]  # noqa: E731
+        total = len(self.names)
+        done = sum(s in ("ok", "flagged") for s in self.status)
+        bad = self.status.count("flagged")
+        elapsed = max(time.monotonic() - self.t0, 1e-9)
+        out = [self.paint("1", fit(f"quantdiff  {self.labels[0]} → {self.labels[1]}")), self.paint("2", fit(self.scope)), ""]
+        if self.planned:
+            got = sum(getattr(s, "fetched", 0) for s in self.stores)
+            moved = max(got - self.fetched0, 0)
+            rate = moved / elapsed
+            left = (self.planned - moved) / rate if rate and moved else None
+            out.append(fit(f"streamed  {bar(moved / self.planned)}  {moved / 1e6:,.0f} / {self.planned / 1e6:,.0f} MB"
+                           f"   {rate / 1e6:.1f} MB/s" + (f"   {clock(left)} left" if left is not None and done < total else "")))
+        line = fit(f"tensors   {bar(done / total if total else 1)}  {done} / {total}   flagged {bad}")
+        if bad and line.endswith(f"flagged {bad}"):
+            line = line[: -len(f"flagged {bad}")] + self.paint("1;31", f"flagged {bad}")
+        out += [line, ""]
+        out += self.grid(w)
+        first = next((i for i, n in enumerate(self.names) if layer_of(n) is not None), None)
+        if first is not None:
+            mine = layer_of(self.names[first])
+            order = " ".join(re.sub(r"_proj$", "", n.split(".")[-2] if n.endswith(".weight") else n.split(".")[-1])
+                             for n in self.names if layer_of(n) == mine)
+            out.append(self.paint("2", fit(f"cells: {order}")))
+        if self.latest:
+            status, name, note = self.latest
+            out += ["", self.cell(status) + " " + fit(f"{name}" + (f"  {note}" if note else ""))[: w - 2]]
+        entries = (("queued", "queued"), ("fetching", "fetching"), ("ok", "clean"), ("flagged", "flagged"))
+        wordy = sum(len(label) + 4 for _, label in entries) - 2 <= w
+        legend = "  ".join(self.cell(s) + (f" {label}" if wordy else "") for s, label in entries)
+        out += ["", legend]
+        return out
+
+    def draw(self, force=False):
+        now = time.monotonic()
+        if not force and now - self.last_draw < 0.1:
+            return
+        self.last_draw = now
+        lines = self.lines()
+        frame = (f"\x1b[{self.drawn}F" if self.drawn else "") + "".join(f"\x1b[2K{line}\n" for line in lines)
+        self.out.write(frame + ("\x1b[J" if len(lines) < self.drawn else ""))
+        self.out.flush()
+        self.drawn = len(lines)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--base", required=True, help="upstream model dir or HF repo id")
@@ -486,6 +615,7 @@ def main(argv=None):
     sel.add_argument("--sample", type=int, metavar="K", help="check K layers spread evenly through the stack (first and last included)")
     sel.add_argument("--layers", metavar="N,N,...", help="check exactly these layer indices")
     ap.add_argument("--prefetch-mb", type=int, default=256, help="streaming: megabytes of tensors fetched ahead of the one being checked (memory ceiling is about this plus the largest tensor)")
+    ap.add_argument("--progress", choices=["auto", "on", "off"], default="auto", help="live terminal view on stderr (auto: only when stderr is a terminal)")
     ap.add_argument("--global", dest="include_global", action="store_true", help="with --sample/--layers, also check tensors outside the layers (embeddings, lm_head, final norm)")
     ap.add_argument("--only", help="regex on upstream tensor names; others are skipped")
     ap.add_argument("--json", help="write the full per-tensor report here")
@@ -501,7 +631,10 @@ def main(argv=None):
             layers = {int(x) for x in args.layers.split(",")}
         elif args.sample:
             layers = set(pick_layers({layer_of(n) for n in base.names} - {None}, args.sample))
-        rep = audit(base, cand, args.only, layers, args.include_global, args.prefetch_mb << 20)
+        show = args.progress == "on" or (args.progress == "auto" and sys.stderr.isatty())
+        label = lambda spec: "/".join(Path(spec).expanduser().parts[-2:]) if Path(spec).expanduser().is_dir() else spec  # noqa: E731
+        progress = Progress(labels=(label(args.base), label(args.candidate))) if show else None
+        rep = audit(base, cand, args.only, layers, args.include_global, args.prefetch_mb << 20, progress)
     except Exception as e:  # noqa: BLE001
         print(f"quantdiff: {e}", file=sys.stderr)
         return 2
