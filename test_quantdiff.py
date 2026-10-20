@@ -461,3 +461,54 @@ def test_render_lists_every_flag_and_says_how_much_of_the_repo_was_read(tmp_path
     rep = run(tmp_path, base, tampered)
     text = qd.render(rep)
     assert text.count("✗ model.layers.") == 20
+
+
+def quantize_stacked(w, bits=4, gs=64):
+    """[E, out, in] -> packed [E, out, packed], scales, biases [E, out, in/gs]."""
+    e, o, i = w.shape
+    q, s, b = quantize(w.reshape(e * o, i), bits, gs)
+    return q.reshape(e, o, -1), s.reshape(e, o, -1), b.reshape(e, o, -1)
+
+
+def fused_expert_pair(tamper_up=False):
+    """Upstream keeps experts fused (gate_up [E, 2I, H], down [E, H, I]); the pack splits them into switch_mlp."""
+    e, inter, hidden = 3, 64, 128
+    gate_up, down = rand(e, 2 * inter, hidden), rand(e, hidden, inter)
+    base = {"model.language_model.layers.0.mlp.experts.gate_up_proj": gate_up,
+            "model.language_model.layers.0.mlp.experts.down_proj": down,
+            "mtp.layers.0.mlp.experts.gate_up_proj": rand(e, 2 * inter, hidden)}
+    up = gate_up[:, inter:].clone()
+    if tamper_up:
+        r = torch.randn(hidden, generator=GEN)
+        r /= r.norm()
+        up = (up.float() - 0.9 * (up.float() @ r)[..., None] * r).to(torch.bfloat16)
+    cand = {}
+    for half, w in (("gate_proj", gate_up[:, :inter]), ("up_proj", up), ("down_proj", down)):
+        q, s, b = quantize_stacked(w.contiguous())
+        stem = f"language_model.model.layers.0.mlp.switch_mlp.{half}"
+        cand[stem + ".weight"], cand[stem + ".scales"], cand[stem + ".biases"] = q, s, b
+    return base, cand
+
+
+def test_fused_experts_compare_against_the_pack_split_experts(tmp_path):
+    base, cand = fused_expert_pair()
+    rep = run(tmp_path, base, cand)
+    assert rep.verdict == "NO FINDINGS", (rep.flagged_names(), rep.only_candidate, rep.only_base)
+    assert sorted(t.name for t in rep.tensors) == sorted([
+        "model.language_model.layers.0.mlp.experts.gate_up_proj[gate]",
+        "model.language_model.layers.0.mlp.experts.gate_up_proj[up]",
+        "model.language_model.layers.0.mlp.experts.down_proj"])
+    assert rep.only_base == ["mtp.layers.0.mlp.experts.gate_up_proj"]  # no pack tensor for the MTP experts here
+
+
+def test_tampered_up_half_is_flagged_and_gate_half_is_not(tmp_path):
+    base, cand = fused_expert_pair(tamper_up=True)
+    rep = run(tmp_path, base, cand)
+    assert rep.flagged_names() == ["model.language_model.layers.0.mlp.experts.gate_up_proj[up]"]
+
+
+def test_rank1_check_runs_on_a_stacked_tensor_whose_total_size_is_over_the_cap(monkeypatch):
+    stacked = torch.outer(torch.arange(16.0), torch.arange(16.0)).repeat(4, 1, 1)  # 4 slices of 16x16
+    monkeypatch.setattr(qd, "SVD_MAX_ELEMS", 300)  # one slice (256) fits, the stack (1024) does not
+    assert stacked.numel() > 300 >= 16 * 16
+    assert qd.rank1_share(stacked) > 0.99
