@@ -4,6 +4,9 @@ Run: python -m pytest -q
 """
 import json
 import sys
+import threading
+from functools import partial
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -160,3 +163,174 @@ def test_missing_candidate_tensor_is_reported_not_flagged(tmp_path):
     rep = run(tmp_path, base, cand)
     assert rep.verdict == "NO FINDINGS"
     assert rep.only_base == ["model.embed_tokens.weight"]
+
+
+class RangeHandler(BaseHTTPRequestHandler):
+    """Serves files under `root` with HTTP Range support; `honor_range=False` mimics a server that ignores it."""
+
+    def __init__(self, *a, root, honor_range=True, **kw):
+        self.root, self.honor_range = Path(root), honor_range
+        super().__init__(*a, **kw)
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        data = (self.root / self.path.lstrip("/")).read_bytes()
+        rng = self.headers.get("Range")
+        if rng and self.honor_range:
+            a, b = rng.split("=")[1].split("-")
+            part = data[int(a) : int(b) + 1]
+            self.send_response(206)
+        else:
+            part = data
+            self.send_response(200)
+        self.send_header("Content-Length", str(len(part)))
+        self.end_headers()
+        self.wfile.write(part)
+
+
+@pytest.fixture
+def serve():
+    servers = []
+
+    def start(root, honor_range=True):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), partial(RangeHandler, root=root, honor_range=honor_range))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        servers.append(srv)
+        return f"http://127.0.0.1:{srv.server_port}"
+
+    yield start
+    for s in servers:
+        s.shutdown()
+
+
+def remote(url):
+    return qd.RemoteStore(["model.safetensors"], lambda f: f"{url}/{f}")
+
+
+def test_remote_store_matches_local_store(tmp_path, serve):
+    base = base_tensors()
+    d = write_model(tmp_path / "base", base)
+    local, rem = qd.Store(d), remote(serve(d))
+    assert rem.names == local.names
+    for n in sorted(local.names):
+        assert torch.equal(rem.get(n), local.get(n)), n
+
+
+def test_remote_audit_matches_local_audit(tmp_path, serve):
+    base = base_tensors()
+    w = base["model.layers.1.mlp.up_proj.weight"].float()
+    r = torch.randn(256, generator=GEN)
+    r /= r.norm()
+    tampered = dict(base)
+    tampered["model.layers.1.mlp.up_proj.weight"] = (w - 0.9 * (w @ r)[:, None] * r[None, :]).to(torch.bfloat16)
+    b = write_model(tmp_path / "base", base)
+    c = write_model(tmp_path / "cand", quant_candidate(tampered))
+    url = serve(tmp_path)
+    got = qd.audit(remote(f"{url}/base"), remote(f"{url}/cand"))
+    want = qd.audit(b, c)
+    assert got.verdict == want.verdict == "FLAGGED"
+    assert got.flagged_names() == want.flagged_names()
+
+
+def test_server_ignoring_range_is_an_error_not_a_full_download(tmp_path, serve):
+    d = write_model(tmp_path / "base", base_tensors())
+    with pytest.raises(RuntimeError, match="Range"):
+        remote(serve(d, honor_range=False))
+
+
+def test_sampled_layers_fetch_fewer_bytes_and_say_so(tmp_path, serve):
+    base = base_tensors()
+    w = base["model.layers.1.mlp.up_proj.weight"].float()
+    r = torch.randn(256, generator=GEN)
+    r /= r.norm()
+    tampered = dict(base)
+    tampered["model.layers.1.mlp.up_proj.weight"] = (w - 0.9 * (w @ r)[:, None] * r[None, :]).to(torch.bfloat16)
+    write_model(tmp_path / "base", base)
+    write_model(tmp_path / "cand", quant_candidate(tampered))
+    url = serve(tmp_path)
+    full_base = remote(f"{url}/base")
+    hit = qd.audit(full_base, remote(f"{url}/cand"), layers={1})
+    assert hit.flagged_names() == ["model.layers.1.mlp.up_proj.weight"]
+    assert hit.layers == [1]
+    miss_base = remote(f"{url}/base")
+    miss = qd.audit(miss_base, remote(f"{url}/cand"), layers={0})
+    assert miss.verdict == "NO FINDINGS" and miss.layers == [0]
+    assert [t.name for t in miss.tensors] == ["model.layers.0.mlp.up_proj.weight"]
+    assert miss_base.fetched < full_base.fetched
+    assert not miss.only_base  # tensors outside the sample are not "missing"
+
+
+def test_pick_layers_spreads_evenly_and_keeps_the_ends():
+    assert qd.pick_layers(list(range(24)), 4) == [0, 8, 15, 23]
+    assert qd.pick_layers(list(range(3)), 8) == [0, 1, 2]
+    assert qd.pick_layers([], 4) == []
+
+
+def test_connection_cut_mid_body_resumes_from_the_bytes_that_arrived(tmp_path, serve):
+    d = write_model(tmp_path / "base", base_tensors())
+    cut = []
+
+    class Cutting(RangeHandler):
+        def do_GET(self):
+            data = (self.root / self.path.lstrip("/")).read_bytes()
+            a, b = self.headers["Range"].split("=")[1].split("-")
+            part = data[int(a) : int(b) + 1]
+            self.send_response(206)
+            self.send_header("Content-Length", str(len(part)))
+            self.end_headers()
+            if len(part) > 1000 and not cut:
+                cut.append(1)
+                self.wfile.write(part[: len(part) - 7])
+                self.wfile.flush()
+                self.close_connection = True
+                return
+            self.wfile.write(part)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), partial(Cutting, root=d))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        rem = qd.RemoteStore(["model.safetensors"], lambda f: f"http://127.0.0.1:{srv.server_port}/{f}")
+        want = qd.Store(d)
+        for n in sorted(want.names):
+            assert torch.equal(rem.get(n), want.get(n)), n
+        assert cut
+    finally:
+        srv.shutdown()
+
+
+def test_redirect_is_followed_once_and_the_token_stays_on_the_first_host(tmp_path, serve):
+    d = write_model(tmp_path / "base", base_tensors())
+    seen = {"hub": [], "cdn": []}
+
+    class Hub(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            seen["hub"].append(self.headers.get("Authorization"))
+            self.send_response(302)
+            self.send_header("Location", f"{cdn}{self.path}")
+            self.end_headers()
+
+    class Spy(RangeHandler):
+        def do_GET(self):
+            seen["cdn"].append(self.headers.get("Authorization"))
+            super().do_GET()
+
+    spy = ThreadingHTTPServer(("127.0.0.1", 0), partial(Spy, root=d))
+    cdn = f"http://127.0.0.1:{spy.server_port}"
+    hub = ThreadingHTTPServer(("127.0.0.1", 0), Hub)
+    for srv in (spy, hub):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        rem = qd.RemoteStore(["model.safetensors"], lambda f: f"http://127.0.0.1:{hub.server_port}/{f}", {"Authorization": "Bearer t"})
+        want = qd.Store(d)
+        for n in sorted(want.names):
+            assert torch.equal(rem.get(n), want.get(n)), n
+    finally:
+        spy.shutdown()
+        hub.shutdown()
+    assert seen["hub"] == ["Bearer t"]  # one redirect for the whole file
+    assert set(seen["cdn"]) == {None} and len(seen["cdn"]) > 1
