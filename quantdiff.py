@@ -136,25 +136,30 @@ class RemoteStore:
     """Tensor access over HTTP Range requests. Reads each shard's safetensors header, then fetches one
     tensor at a time, so nothing touches disk and memory holds one tensor."""
 
-    def __init__(self, files, url_for, headers=None):
+    def __init__(self, files, url_for, headers=None, on_progress=None):
         self.headers = dict(headers or {})
         self.fetched = 0
         self.total_bytes = 0
         self.targets = {}
         self.lock = threading.Lock()
         self.index = {}
-        for f in files:
+        def read_header(f):
             url = url_for(f)
             (n,) = struct.unpack("<Q", self._range(url, 0, 7))
             if n > 1 << 28:
                 raise RuntimeError(f"{url}: safetensors header claims {n} bytes")
-            header, base = json.loads(self._range(url, 8, 7 + n)), 8 + n
-            for name, meta in header.items():
-                if name == "__metadata__":
-                    continue
-                start, end = meta["data_offsets"]
-                self.index[name] = (url, base + start, base + end, SAFETENSORS_DTYPES[meta["dtype"]], meta["shape"])
-                self.total_bytes += end - start
+            return url, json.loads(self._range(url, 8, 7 + n)), 8 + n
+
+        with ThreadPoolExecutor(max(1, min(16, len(files)))) as pool:  # ~2 s of latency per request, 131 shards in some repos
+            for done, (url, header, base) in enumerate(pool.map(read_header, files), 1):
+                for name, meta in header.items():
+                    if name == "__metadata__":
+                        continue
+                    start, end = meta["data_offsets"]
+                    self.index[name] = (url, base + start, base + end, SAFETENSORS_DTYPES[meta["dtype"]], meta["shape"])
+                    self.total_bytes += end - start
+                if on_progress:
+                    on_progress(done, len(files))
         if not self.index:
             raise FileNotFoundError("no safetensors tensors found")
         self.names = set(self.index)
@@ -224,7 +229,7 @@ def cached_dir(spec):
     return d if any(d.glob("*.safetensors")) else None
 
 
-def open_store(spec, stream=False, revision=None):
+def open_store(spec, stream=False, revision=None, on_progress=None):
     """A directory, else the local HF cache, else (stream) Range requests, else a full download."""
     p = Path(spec).expanduser()
     if p.is_dir():
@@ -240,7 +245,8 @@ def open_store(spec, stream=False, revision=None):
     sha = api.model_info(spec, revision=revision).sha
     files = sorted(f for f in api.list_repo_files(spec, revision=sha) if f.endswith(".safetensors"))
     token = get_token()
-    store = RemoteStore(files, lambda f: hf_hub_url(spec, f, revision=sha), {"Authorization": f"Bearer {token}"} if token else None)
+    store = RemoteStore(files, lambda f: hf_hub_url(spec, f, revision=sha),
+                        {"Authorization": f"Bearer {token}"} if token else None, on_progress)
     store.revision = sha
     return store
 
@@ -604,6 +610,14 @@ class Progress:
         self.drawn = len(lines)
 
 
+def header_status(label):
+    """stderr line while a streamed repo's shard headers load, so a repo with 100+ shards doesn't look hung."""
+    def say(done, total):
+        if sys.stderr.isatty() or done == total:
+            print(f"\rreading {label} shard headers {done}/{total}", end="\n" if done == total else "", file=sys.stderr, flush=True)
+    return say
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--base", required=True, help="upstream model dir or HF repo id")
@@ -621,8 +635,8 @@ def main(argv=None):
     ap.add_argument("--json", help="write the full per-tensor report here")
     args = ap.parse_args(argv)
     try:
-        base = open_store(args.base, args.stream, args.base_revision)
-        cand = open_store(args.candidate, args.stream, args.candidate_revision)
+        base = open_store(args.base, args.stream, args.base_revision, header_status("upstream"))
+        cand = open_store(args.candidate, args.stream, args.candidate_revision, header_status("candidate"))
         for label, st in (("upstream", base), ("candidate", cand)):
             if hasattr(st, "revision"):
                 print(f"{label} pinned at {st.revision}")
