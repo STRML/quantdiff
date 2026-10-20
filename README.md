@@ -12,6 +12,25 @@ python quantdiff.py --base Qwen/Qwen2.5-0.5B-Instruct \
 
 Arguments are directories or Hugging Face repo ids (local cache first). Exit 0 is no findings, 1 is flagged, 2 is could not run. Needs `torch`, `safetensors` and `huggingface_hub`.
 
+## Check without downloading
+
+```
+python quantdiff.py --stream --sample 4 \
+    --base Qwen/Qwen2.5-0.5B-Instruct \
+    --candidate huihui-ai/Qwen2.5-0.5B-Instruct-abliterated-v3
+```
+
+`--stream` reads repo ids that aren't in your cache with HTTP Range requests: the safetensors header first, then one tensor at a time. Nothing is written to disk, and memory holds the tensors being checked plus `--prefetch-mb` (default 256) fetched ahead. Both the upstream and the candidate stream, so you can vet a quant before you download it. The upstream is pinned to a commit hash and the hash is printed.
+
+`--sample K` checks K layers spread through the stack, first and last included. `--layers 5,10,20` picks them yourself, and `--global` adds the embeddings and `lm_head`. A sampled run says so in its output, and it only covers the layers it names.
+
+| Candidate (streamed, `--sample 4`) | Fetched | Time | Result |
+|---|---|---|---|
+| `mlx-community/Qwen2.5-0.5B-Instruct-4bit` | 153 of 1,266 MB | 50 s | No findings, 48 tensors |
+| `huihui-ai/Qwen2.5-0.5B-Instruct-abliterated-v3` | 239 of 1,976 MB | 49 s | Flagged, 6 of 48: `o_proj` and `down_proj` in layers 8, 15 and 23 (layer 0 is untouched in this model) |
+
+Each request costs about 2 s of latency here, so the prefetch matters: one request at a time took 4m20 for the second row.
+
 ## How it decides
 
 ```
@@ -41,7 +60,8 @@ No findings means no tampering this method can see. It is not a safety certifica
 
 - An edit smaller than the rounding noise and spread over many directions passes.
 - The thresholds were set on one real 4-bit MLX quant. Mixed-bit packs, imatrix-tuned quants, GGUF and larger models are untested, so recalibrate before you trust it.
-- You need the full upstream weights on disk, at the exact revision the candidate was made from. A different revision flags everything.
+- The upstream must be the exact revision the candidate was made from. A different revision flags everything.
+- A sample misses edits in the layers it skips. Four layers caught this abliteration because it touches nearly every layer. A backdoor confined to a few layers needs `--layers` aimed at them or a full run.
 - Stacked mixture-of-experts tensors match by name only. A repo that re-stacks the experts reports them as missing.
 - Safetensors only. NVFP4 and W4A8 files are not read.
 - Tokenizer, chat template and config tampering are out of scope.
