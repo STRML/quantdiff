@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Diff a quantized (or fine-tuned, or abliterated) model against its upstream weights.
 
-    quantdiff.py --base <upstream dir|hf repo> --candidate <dir|hf repo> [--json out.json] [--only REGEX]
+    quantdiff.py --base <upstream dir|hf repo> --candidate <dir|hf repo> [--stream] [--sample K | --layers N,N] [--json out.json] [--only REGEX]
 
 Defends against weight-level tampering (https://projectdiscovery.io/research/how-abliterated-models-can-get-you-pwned):
 a LoRA-merged backdoor or an abliteration edit changes a few tensors by a structured, low-rank amount. A clean
@@ -17,14 +17,26 @@ quant differs from upstream only by rounding noise, which has two properties the
                       dtype cast). Any difference is a modification. Dense-vs-dense diffs (a fine-tune or
                       an abliterated bf16 release) take this path too, and `rank1` shows the edit shape.
 
+--stream reads a repo id that is not in the local cache with HTTP Range requests: the safetensors header, then one
+tensor at a time. Nothing is written to disk and memory holds one tensor pair. --sample K checks K layers spread
+through the stack and says so in the verdict, which makes a first pass cheap.
+
 Exit status: 0 no findings, 1 flagged, 2 could not run. Needs torch and safetensors; huggingface_hub to resolve repo ids.
 NO FINDINGS means no sign of tampering that this method can see. It is not a safety certificate.
 Tensors only: tokenizer, chat template and config tampering are not covered.
 """
 import argparse
+import http.client
 import json
 import re
+import struct
 import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -63,6 +75,9 @@ class Report:
     tensors: list
     only_candidate: list
     only_base: list
+    layers: list = None  # layers checked when sampling; None means every tensor
+    fetched: int = 0  # bytes streamed over HTTP (base and candidate); nothing is written to disk
+    remote_total: int = 0  # bytes in the streamed repos
 
     @property
     def verdict(self):
@@ -95,18 +110,148 @@ class Store:
         return self.handles[f].get_tensor(name)
 
 
-def resolve(spec):
-    p = Path(spec).expanduser()
-    if p.is_dir():
-        return p
+SAFETENSORS_DTYPES = {
+    "BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32, "F64": torch.float64,
+    "I8": torch.int8, "I16": torch.int16, "I32": torch.int32, "I64": torch.int64,
+    "U8": torch.uint8, "U16": torch.uint16, "U32": torch.uint32, "U64": torch.uint64, "BOOL": torch.bool,
+}
+
+
+class _DropAuthOffHost(urllib.request.HTTPRedirectHandler):
+    """Hub downloads redirect to a CDN; the bearer token must not follow them to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urllib.parse.urlparse(newurl).netloc != urllib.parse.urlparse(req.full_url).netloc:
+            new.headers.pop("Authorization", None)
+        return new
+
+
+_OPENER = urllib.request.build_opener(_DropAuthOffHost)
+
+
+class RemoteStore:
+    """Tensor access over HTTP Range requests. Reads each shard's safetensors header, then fetches one
+    tensor at a time, so nothing touches disk and memory holds one tensor."""
+
+    def __init__(self, files, url_for, headers=None):
+        self.headers = dict(headers or {})
+        self.fetched = 0
+        self.total_bytes = 0
+        self.targets = {}
+        self.lock = threading.Lock()
+        self.index = {}
+        for f in files:
+            url = url_for(f)
+            (n,) = struct.unpack("<Q", self._range(url, 0, 7))
+            if n > 1 << 28:
+                raise RuntimeError(f"{url}: safetensors header claims {n} bytes")
+            header, base = json.loads(self._range(url, 8, 7 + n)), 8 + n
+            for name, meta in header.items():
+                if name == "__metadata__":
+                    continue
+                start, end = meta["data_offsets"]
+                self.index[name] = (url, base + start, base + end, SAFETENSORS_DTYPES[meta["dtype"]], meta["shape"])
+                self.total_bytes += end - start
+        if not self.index:
+            raise FileNotFoundError("no safetensors tensors found")
+        self.names = set(self.index)
+
+    def _open(self, url, first, last):
+        """Request first..last of `url`, following the Hub's redirect to its CDN once per file and reusing that
+        target afterwards. The token goes only to the host the caller named."""
+        target = self.targets.get(url, url)
+        headers = dict(self.headers)
+        if urllib.parse.urlparse(target).netloc != urllib.parse.urlparse(url).netloc:
+            headers.pop("Authorization", None)
+        req = urllib.request.Request(target, headers={**headers, "Range": f"bytes={first}-{last}"})
+        try:
+            r = _OPENER.open(req, timeout=60)
+        except urllib.error.HTTPError as e:
+            if target != url and e.code in (400, 401, 403):  # the signed CDN link expired
+                self.targets.pop(url, None)
+                return self._open(url, first, last)
+            raise
+        self.targets[url] = r.geturl()
+        return r
+
+    def _range(self, url, first, last):
+        """Bytes first..last inclusive. A connection cut mid-body keeps what arrived and asks for the rest."""
+        want, buf, failure = last - first + 1, bytearray(), None
+        for attempt in range(5):
+            try:
+                with self._open(url, first + len(buf), last) as r:
+                    if r.status != 206:
+                        raise RuntimeError(f"{url} ignored the Range header (HTTP {r.status}); not downloading the whole file")
+                    buf += r.read()
+            except urllib.error.HTTPError as e:
+                if e.code < 500:
+                    raise RuntimeError(f"{url}: HTTP {e.code}") from e
+                failure = e
+            except http.client.IncompleteRead as e:
+                buf += e.partial
+                failure = e
+            except (OSError, http.client.HTTPException) as e:
+                failure = e
+            if len(buf) == want:
+                with self.lock:
+                    self.fetched += want
+                return bytes(buf)
+            if len(buf) > want:
+                raise RuntimeError(f"{url}: asked for {want} bytes, got {len(buf)}")
+            time.sleep(1 + attempt)
+        raise RuntimeError(f"{url}: {failure}")
+
+    def size(self, name):
+        return self.index[name][2] - self.index[name][1]
+
+    def get(self, name):
+        url, start, end, dtype, shape = self.index[name]
+        if end == start:
+            return torch.empty(shape, dtype=dtype)
+        return torch.frombuffer(bytearray(self._range(url, start, end - 1)), dtype=dtype).reshape(shape)
+
+
+def cached_dir(spec):
     from huggingface_hub import snapshot_download
 
-    for local in (True, False):
-        try:
-            return Path(snapshot_download(spec, allow_patterns=["*.safetensors", "*.json"], local_files_only=local))
-        except Exception:  # noqa: BLE001 - cache miss, then network; surface the second failure
-            if not local:
-                raise
+    try:
+        d = Path(snapshot_download(spec, allow_patterns=["*.safetensors", "*.json"], local_files_only=True))
+    except Exception:  # noqa: BLE001 - not in the cache
+        return None
+    return d if any(d.glob("*.safetensors")) else None
+
+
+def open_store(spec, stream=False, revision=None):
+    """A directory, else the local HF cache, else (stream) Range requests, else a full download."""
+    p = Path(spec).expanduser()
+    if p.is_dir():
+        return Store(p)
+    d = cached_dir(spec) if revision is None else None
+    if d:
+        return Store(d)
+    from huggingface_hub import HfApi, get_token, hf_hub_url, snapshot_download
+
+    if not stream:
+        return Store(Path(snapshot_download(spec, allow_patterns=["*.safetensors", "*.json"], revision=revision)))
+    api = HfApi()
+    sha = api.model_info(spec, revision=revision).sha
+    files = sorted(f for f in api.list_repo_files(spec, revision=sha) if f.endswith(".safetensors"))
+    token = get_token()
+    store = RemoteStore(files, lambda f: hf_hub_url(spec, f, revision=sha), {"Authorization": f"Bearer {token}"} if token else None)
+    store.revision = sha
+    return store
+
+
+def pick_layers(layers, k):
+    """k layers spread evenly across the stack, first and last included."""
+    layers = sorted(layers)
+    if k >= len(layers):
+        return layers
+    if k == 1:
+        return layers[-1:]
+    n = len(layers)
+    return [layers[i] for i in sorted({round(j * (n - 1) / (k - 1)) for j in range(k)})]
 
 
 def suffix_index(names):
@@ -233,13 +378,42 @@ def check_plain(name, base_w, cand_w):
     return res
 
 
-def audit(base_dir, cand_dir, only=None):
-    base, cand = Store(base_dir), Store(cand_dir)
+def stream_units(units, budget, workers=8):
+    """Yield (unit, tensors) in order. Remote tensors are fetched ahead on a thread pool, at most `budget` bytes
+    beyond the unit being checked (one request costs ~2 s of latency, so one at a time is slow)."""
+    size = lambda u: sum(s.size(n) for s, n in u[1] if hasattr(s, "size"))  # noqa: E731
+    if not any(hasattr(s, "size") for u in units[:1] for s, _ in u[1]):
+        for u in units:
+            yield u, [s.get(n) for s, n in u[1]]
+        return
+    with ThreadPoolExecutor(workers) as pool:
+        pending, nxt, held = {}, 0, 0
+        for i, u in enumerate(units):
+            while nxt < len(units) and (nxt <= i or held + size(units[nxt]) <= budget):
+                pending[nxt] = [pool.submit(s.get, n) for s, n in units[nxt][1]]
+                held += size(units[nxt])
+                nxt += 1
+            tensors = [f.result() for f in pending.pop(i)]
+            held -= size(u)
+            yield u, tensors
+
+
+def audit(base, cand, only=None, layers=None, include_global=False, prefetch_bytes=256 << 20):
+    """`base` and `cand` are stores or directories. `layers` limits the check to those layer indices."""
+    base = base if hasattr(base, "get") else Store(base)
+    cand = cand if hasattr(cand, "get") else Store(cand)
+
+    def in_scope(name):
+        if layers is None:
+            return True
+        layer = layer_of(name)
+        return include_global if layer is None else layer in layers
+
     index = suffix_index(base.names)
     quant_stems = {n[: -len(".scales")] for n in cand.names if n.endswith(".scales") and n[: -len(".scales")] + ".weight" in cand.names}
     skip = {s + suffix for s in quant_stems for suffix in (".scales", ".biases")}
     pat = re.compile(only) if only else None
-    results, only_cand, matched = [], [], set()
+    units, only_cand, matched = [], [], set()
     for name in sorted(cand.names - skip):
         stem = name[: -len(".weight")] if name.endswith(".weight") else None
         target = match_name(name, base.names, index)
@@ -247,19 +421,23 @@ def audit(base_dir, cand_dir, only=None):
             only_cand.append(name)
             continue
         matched.add(target)
-        if pat and not pat.search(target):
+        if not in_scope(target) or (pat and not pat.search(target)):
             continue
-        base_w = base.get(target)
+        fetch = [(base, target), (cand, name)]
         if stem in quant_stems:
-            r = check_quant(target, base_w, cand.get(name), cand.get(stem + ".scales"), cand.get(stem + ".biases"))
-        else:
-            r = check_plain(target, base_w, cand.get(name))
-        results.append(r)
-    return Report(results, only_cand, sorted(base.names - matched))
+            fetch += [(cand, stem + ".scales"), (cand, stem + ".biases")]
+        units.append((target, fetch))
+    results = []
+    for (target, fetch), tensors in stream_units(units, prefetch_bytes):
+        results.append(check_quant(target, *tensors) if len(tensors) == 4 else check_plain(target, *tensors))
+    return Report(results, only_cand, sorted(n for n in base.names - matched if in_scope(n)),
+                  None if layers is None else sorted(layers),
+                  sum(getattr(s, "fetched", 0) for s in (base, cand)),
+                  sum(getattr(s, "total_bytes", 0) for s in (base, cand)))
 
 
 def layer_of(name):
-    m = re.search(r"\.(?:layers|blocks|h)\.(\d+)\.", name)
+    m = re.search(r"(?:^|\.)(?:layers|blocks|h)\.(\d+)\.", name)
     return int(m.group(1)) if m else None
 
 
@@ -269,6 +447,10 @@ def render(rep, top=15):
     q = [t for t in rep.tensors if t.kind == "quant"]
     out.append(f"{rep.verdict}: {len(flagged)} of {len(rep.tensors)} tensors flagged, "
                f"{len(rep.only_candidate)} not in upstream, {len(rep.only_base)} missing from candidate")
+    if rep.layers is not None:
+        out.append(f"sampled layers {rep.layers} only; every other layer is unchecked, so this is not a full result")
+    if rep.remote_total:
+        out.append(f"streamed {rep.fetched / 1e6:,.0f} MB of {rep.remote_total / 1e6:,.0f} MB, nothing written to disk")
     if q:
         bits = sorted({(t.bits, t.group_size) for t in q})
         out.append(f"quantized: {len(q)} tensors, (bits, group) {bits}, median error ratio "
@@ -297,11 +479,29 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--base", required=True, help="upstream model dir or HF repo id")
     ap.add_argument("--candidate", required=True, help="quantized / fine-tuned model dir or HF repo id")
+    ap.add_argument("--stream", action="store_true", help="repo ids not in the local cache are read with HTTP Range requests, one tensor at a time, instead of downloaded")
+    ap.add_argument("--base-revision", help="upstream branch, tag or commit (printed as a commit hash when streaming)")
+    ap.add_argument("--candidate-revision", help="candidate branch, tag or commit")
+    sel = ap.add_mutually_exclusive_group()
+    sel.add_argument("--sample", type=int, metavar="K", help="check K layers spread evenly through the stack (first and last included)")
+    sel.add_argument("--layers", metavar="N,N,...", help="check exactly these layer indices")
+    ap.add_argument("--prefetch-mb", type=int, default=256, help="streaming: megabytes of tensors fetched ahead of the one being checked (memory ceiling is about this plus the largest tensor)")
+    ap.add_argument("--global", dest="include_global", action="store_true", help="with --sample/--layers, also check tensors outside the layers (embeddings, lm_head, final norm)")
     ap.add_argument("--only", help="regex on upstream tensor names; others are skipped")
     ap.add_argument("--json", help="write the full per-tensor report here")
     args = ap.parse_args(argv)
     try:
-        rep = audit(resolve(args.base), resolve(args.candidate), args.only)
+        base = open_store(args.base, args.stream, args.base_revision)
+        cand = open_store(args.candidate, args.stream, args.candidate_revision)
+        for label, st in (("upstream", base), ("candidate", cand)):
+            if hasattr(st, "revision"):
+                print(f"{label} pinned at {st.revision}")
+        layers = None
+        if args.layers:
+            layers = {int(x) for x in args.layers.split(",")}
+        elif args.sample:
+            layers = set(pick_layers({layer_of(n) for n in base.names} - {None}, args.sample))
+        rep = audit(base, cand, args.only, layers, args.include_global, args.prefetch_mb << 20)
     except Exception as e:  # noqa: BLE001
         print(f"quantdiff: {e}", file=sys.stderr)
         return 2
@@ -309,6 +509,7 @@ def main(argv=None):
     if args.json:
         Path(args.json).write_text(json.dumps({"verdict": rep.verdict, "only_candidate": rep.only_candidate,
                                                "only_base": rep.only_base,
+                                               "layers": rep.layers,
                                                "tensors": [asdict(t) for t in rep.tensors]}, indent=1))
     return 0 if rep.verdict == "NO FINDINGS" else 1
 
