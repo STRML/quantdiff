@@ -392,3 +392,18 @@ def test_audit_drives_the_progress_view(tmp_path):
     assert f"{n} / {n}" in final
     assert "✗ model.layers.1.mlp.up_proj.weight" in final  # last tensor checked, and it is the flagged one
     assert final.count("✗") == 3  # its cell, the latest line, the legend
+
+
+def test_headers_of_many_shards_load_in_parallel_and_report_progress(tmp_path, serve):
+    d = tmp_path / "base"
+    d.mkdir()
+    tensors = base_tensors()
+    items = sorted(tensors.items())
+    for i, (k, v) in enumerate(items):
+        save_file({k: v}, str(d / f"model-0000{i}-of-0000{len(items)}.safetensors"))
+    files = sorted(p.name for p in d.glob("*.safetensors"))
+    seen = []
+    url = serve(d)
+    rem = qd.RemoteStore(files, lambda f: f"{url}/{f}", on_progress=lambda done, total: seen.append((done, total)))
+    assert rem.names == set(tensors)
+    assert seen[-1] == (len(files), len(files)) and [x[0] for x in seen] == list(range(1, len(files) + 1))
