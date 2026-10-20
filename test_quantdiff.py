@@ -334,3 +334,61 @@ def test_redirect_is_followed_once_and_the_token_stays_on_the_first_host(tmp_pat
         hub.shutdown()
     assert seen["hub"] == ["Bearer t"]  # one redirect for the whole file
     assert set(seen["cdn"]) == {None} and len(seen["cdn"]) > 1
+
+
+import io  # noqa: E402
+
+
+def make_progress(width=80, color=False):
+    return qd.Progress(out=io.StringIO(), color=color, width=width, labels=("Qwen/base", "me/quant"))
+
+
+def test_progress_shows_every_tensor_by_layer_with_status_glyphs():
+    p = make_progress()
+    units = [(f"model.layers.{l}.mlp.{n}.weight", []) for l in (0, 1) for n in ("down_proj", "up_proj", "gate_proj")]
+    p.begin(units, (), {0, 1})
+    p.status[:] = ["ok", "flagged", "ok", "fetching", "queued", "queued"]
+    p.latest = ("flagged", "model.layers.0.mlp.up_proj.weight", "100% of the change is one direction")
+    text = "\n".join(p.lines())
+    assert text.count("■") == 2 + 1  # two ok cells, plus the legend entry
+    assert text.count("✗") == 1 + 1 + 1  # flagged cell, the latest line, the legend entry
+    assert "◐" in text and "·" in text
+    assert "tensors" in text and "3 / 6" in text  # done = clean + flagged
+    assert "Qwen/base" in text and "me/quant" in text
+    assert "\x1b" not in text
+
+
+def test_progress_lines_never_exceed_the_terminal_width():
+    p = make_progress(width=40)
+    units = [(f"model.layers.{l}.self_attn.q_proj.weight", []) for l in range(30)]
+    p.begin(units, (), set(range(30)))
+    p.latest = ("ok", "model.layers.29.self_attn.q_proj.weight" * 3, "")
+    assert all(len(line) <= 39 for line in p.lines())
+
+
+def test_progress_redraws_in_place_and_ends_on_a_final_frame():
+    p = make_progress(color=True)
+    p.begin([("model.layers.0.a.weight", [])], (), {0})
+    p.draw(force=True)
+    p.draw(force=True)
+    out = p.out.getvalue()
+    assert out.count("\x1b[") > 0 and "F" in out  # second frame moves the cursor back up first
+
+
+def test_audit_drives_the_progress_view(tmp_path):
+    base = base_tensors()
+    w = base["model.layers.1.mlp.up_proj.weight"].float()
+    r = torch.randn(256, generator=GEN)
+    r /= r.norm()
+    tampered = dict(base)
+    tampered["model.layers.1.mlp.up_proj.weight"] = (w - 0.9 * (w @ r)[:, None] * r[None, :]).to(torch.bfloat16)
+    b = write_model(tmp_path / "base", base)
+    c = write_model(tmp_path / "cand", quant_candidate(tampered))
+    p = make_progress()
+    rep = qd.audit(b, c, progress=p)
+    final = "\n".join(p.lines())
+    assert rep.verdict == "FLAGGED"
+    n = len(rep.tensors)
+    assert f"{n} / {n}" in final
+    assert "✗ model.layers.1.mlp.up_proj.weight" in final  # last tensor checked, and it is the flagged one
+    assert final.count("✗") == 3  # its cell, the latest line, the legend
