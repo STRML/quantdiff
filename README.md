@@ -10,7 +10,7 @@ python quantdiff.py --base Qwen/Qwen2.5-0.5B-Instruct \
                     [--only REGEX] [--json out.json]
 ```
 
-Arguments are directories or Hugging Face repo ids (local cache first). Exit 0 is no findings, 1 is flagged, 2 is could not run. Needs `torch`, `safetensors` and `huggingface_hub`.
+Arguments are directories or Hugging Face repo ids (local cache first). Exit 0 is no findings, 1 is flagged, 2 is could not run. Needs `torch`, `safetensors` and `huggingface_hub`; `pip install -r requirements.txt` also adds `numpy` and `pytest`. The tool itself doesn't import numpy, but the tests do (through `safetensors`).
 
 ## Check without downloading
 
