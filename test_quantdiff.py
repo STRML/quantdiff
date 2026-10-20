@@ -407,3 +407,57 @@ def test_headers_of_many_shards_load_in_parallel_and_report_progress(tmp_path, s
     rem = qd.RemoteStore(files, lambda f: f"{url}/{f}", on_progress=lambda done, total: seen.append((done, total)))
     assert rem.names == set(tensors)
     assert seen[-1] == (len(files), len(files)) and [x[0] for x in seen] == list(range(1, len(files) + 1))
+
+
+def test_layer_key_separates_language_vision_and_mtp_stacks_and_ignores_prefix_order():
+    k = qd.layer_key
+    assert k("model.language_model.layers.0.mlp.gate.weight") == k("language_model.model.layers.0.mlp.gate.weight")
+    assert k("model.language_model.layers.0.a.weight") != k("mtp.layers.0.a.weight")
+    assert k("model.language_model.layers.0.a.weight") != k("model.visual.blocks.0.a.weight")
+    assert k("model.embed_tokens.weight") is None
+    assert k("model.layers.7.mlp.up_proj.weight") == ("layers", 7)
+
+
+def test_sample_keys_picks_per_stack():
+    names = [f"model.language_model.layers.{i}.a.weight" for i in range(8)] + ["mtp.layers.0.a.weight"]
+    assert qd.sample_keys(names, 2) == {("language_model.layers", 0), ("language_model.layers", 7), ("mtp.layers", 0)}
+
+
+def test_pack_with_swapped_prefix_order_matches_upstream(tmp_path):
+    base = {"model.language_model.layers.0.mlp.up_proj.weight": rand(128, 256), "mtp.layers.0.mlp.up_proj.weight": rand(128, 256)}
+    cand = quant_candidate(base, prefix="")  # both stacks share the suffix layers.0.mlp.up_proj.weight, so suffix matching is ambiguous
+    cand = {k.replace("model.language_model.", "language_model.model."): v for k, v in cand.items()}
+    rep = run(tmp_path, base, cand)
+    assert rep.verdict == "NO FINDINGS" and not rep.only_candidate and not rep.only_base
+
+
+def shifted(base, name, delta, noise=0.0):
+    out = {k: v.clone() for k, v in base.items()}
+    out[name] = (out[name].float() + delta + noise * torch.randn(out[name].shape, generator=GEN)).to(torch.bfloat16)
+    return out
+
+
+def test_constant_shift_of_a_norm_vector_is_noted_not_flagged(tmp_path):
+    base = base_tensors()
+    name = "model.layers.1.input_layernorm.weight"
+    rep = run(tmp_path, base, shifted(base, name, -1.0))
+    t = next(t for t in rep.tensors if t.name == name)
+    assert rep.verdict == "NO FINDINGS" and not t.flagged
+    assert t.shift == pytest.approx(-1.0, abs=0.01)
+    assert "constant shift" in qd.render(rep) and "-1.00" in qd.render(rep)
+
+
+def test_constant_shift_of_a_weight_matrix_or_a_noisy_shift_is_flagged(tmp_path):
+    base = base_tensors()
+    rep = run(tmp_path / "a", base, shifted(base, "model.layers.0.mlp.up_proj.weight", 0.5))
+    assert rep.flagged_names() == ["model.layers.0.mlp.up_proj.weight"]
+    rep = run(tmp_path / "b", base, shifted(base, "model.layers.1.input_layernorm.weight", 1.0, noise=0.5))
+    assert rep.flagged_names() == ["model.layers.1.input_layernorm.weight"]
+
+
+def test_render_lists_every_flag_and_says_how_much_of_the_repo_was_read(tmp_path):
+    base = {f"model.layers.{i}.mlp.up_proj.weight": rand(128, 256) for i in range(20)}
+    tampered = {k: (v.float() * 3).to(torch.bfloat16) for k, v in base.items()}
+    rep = run(tmp_path, base, tampered)
+    text = qd.render(rep)
+    assert text.count("✗ model.layers.") == 20
