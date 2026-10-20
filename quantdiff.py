@@ -50,6 +50,7 @@ VIOL_FRAC = 1e-4  # share of elements past the rounding bound that flags a quant
 RATIO_MAX = 1.5  # error vs re-quantized upstream
 RANK1_EXCESS = 0.03  # share of a quantized tensor's error in one direction beyond what re-quantizing upstream gives (clean quants: <= 0.01)
 SVD_MAX_ELEMS = 3e8
+FLAG_LIST = 60  # flagged tensors printed in full
 SVD_SLICES = 8  # 3-D (stacked expert) tensors: slices sampled for the rank-1 check
 
 
@@ -65,6 +66,7 @@ class TensorResult:
     viol_frac: float = 0.0
     rank1: float = 0.0
     rank1_ref: float = 0.0
+    shift: float = None  # constant offset from upstream on a 1-D tensor (a conversion step, not flagged)
     reasons: list = field(default_factory=list)
 
     @property
@@ -272,9 +274,23 @@ def suffix_index(names):
     return {s: v[0] for s, v in seen.items() if len(v) == 1}
 
 
-def match_name(name, base_names, index):
+def canon(name):
+    """Name with the `model` segments dropped, so `model.language_model.x` and `language_model.model.x` agree."""
+    return ".".join(p for p in name.split(".") if p != "model")
+
+
+def canon_index(names):
+    seen = {}
+    for n in names:
+        seen.setdefault(canon(n), []).append(n)
+    return {c: v[0] for c, v in seen.items() if len(v) == 1}
+
+
+def match_name(name, base_names, index, by_canon=None):
     if name in base_names:
         return name
+    if by_canon and canon(name) in by_canon:
+        return by_canon[canon(name)]
     segs = name.split(".")
     for i in range(len(segs) - 1):
         hit = index.get(".".join(segs[i:]))
@@ -380,6 +396,10 @@ def check_plain(name, base_w, cand_w):
     res.rel_err = rel(delta, base_w)
     res.rank1 = rank1_share(delta)
     if res.rel_err > CAST_TOL:
+        mean, spread = float(delta.mean()), float(delta.std()) if delta.numel() > 1 else 0.0
+        if base_w.ndim <= 1 and abs(mean) >= 1e-3 and spread <= 0.01 * abs(mean):
+            res.shift = mean  # e.g. zero-centered RMSNorm weights stored as 1 + w; reported, not flagged
+            return res
         res.reasons.append(f"differs from upstream by {res.rel_err:.2%}")
         if res.rank1 > 0.5:
             res.reasons.append(f"{res.rank1:.0%} of the change is one direction")
@@ -416,17 +436,17 @@ def audit(base, cand, only=None, layers=None, include_global=False, prefetch_byt
     def in_scope(name):
         if layers is None:
             return True
-        layer = layer_of(name)
-        return include_global if layer is None else layer in layers
+        key = layer_key(name)
+        return include_global if key is None else (key in layers or key[1] in layers)
 
-    index = suffix_index(base.names)
+    index, by_canon = suffix_index(base.names), canon_index(base.names)
     quant_stems = {n[: -len(".scales")] for n in cand.names if n.endswith(".scales") and n[: -len(".scales")] + ".weight" in cand.names}
     skip = {s + suffix for s in quant_stems for suffix in (".scales", ".biases")}
     pat = re.compile(only) if only else None
     units, only_cand, matched = [], [], set()
     for name in sorted(cand.names - skip):
         stem = name[: -len(".weight")] if name.endswith(".weight") else None
-        target = match_name(name, base.names, index)
+        target = match_name(name, base.names, index, by_canon)
         if target is None:
             only_cand.append(name)
             continue
@@ -447,14 +467,46 @@ def audit(base, cand, only=None, layers=None, include_global=False, prefetch_byt
     if progress:
         progress.finish()
     return Report(results, only_cand, sorted(n for n in base.names - matched if in_scope(n)),
-                  None if layers is None else sorted(layers),
+                  None if layers is None else sorted(layers, key=str),
                   sum(getattr(s, "fetched", 0) for s in (base, cand)),
                   sum(getattr(s, "total_bytes", 0) for s in (base, cand)))
 
 
-def layer_of(name):
-    m = re.search(r"(?:^|\.)(?:layers|blocks|h)\.(\d+)\.", name)
-    return int(m.group(1)) if m else None
+def layer_key(name):
+    """(stack, index) for a layered tensor. Stacks are told apart by their prefix, so the language model's layer 0,
+    the MTP head's layer 0 and the vision tower's block 0 are three different keys. None for embeddings and the like."""
+    m = re.search(r"(?:^|\.)(layers|blocks|h)\.(\d+)\.", name)
+    if not m:
+        return None
+    prefix = [p for p in name[: m.start()].split(".") if p and p != "model"]
+    return ".".join(prefix + [m.group(1)]), int(m.group(2))
+
+
+def sample_keys(names, k):
+    stacks = {}
+    for n in names:
+        key = layer_key(n)
+        if key:
+            stacks.setdefault(key[0], set()).add(key[1])
+    return {(stack, i) for stack, idx in stacks.items() for i in pick_layers(idx, k)}
+
+
+def key_label(key, multi):
+    stack, idx = key
+    short = re.sub(r"\.?(layers|blocks|h)$", "", stack)
+    return f"{short}.{idx}" if multi and short else str(idx)
+
+
+def describe_layers(layers):
+    if layers is None:
+        return "all layers"
+    plain = sorted(x for x in layers if isinstance(x, int))
+    stacks = {}
+    for x in layers:
+        if isinstance(x, tuple):
+            stacks.setdefault(x[0], []).append(x[1])
+    parts = ([f"layers {plain}"] if plain else []) + [f"{re.sub(chr(46) + '?(layers|blocks|h)$', '', st) or st} {sorted(v)}" for st, v in sorted(stacks.items())]
+    return "; ".join(parts)
 
 
 def render(rep, top=15):
@@ -464,26 +516,36 @@ def render(rep, top=15):
     out.append(f"{rep.verdict}: {len(flagged)} of {len(rep.tensors)} tensors flagged, "
                f"{len(rep.only_candidate)} not in upstream, {len(rep.only_base)} missing from candidate")
     if rep.layers is not None:
-        out.append(f"sampled layers {rep.layers} only; every other layer is unchecked, so this is not a full result")
+        out.append(f"sampled {describe_layers(rep.layers)} only; every other layer is unchecked, so this is not a full result")
     if rep.remote_total:
-        out.append(f"streamed {rep.fetched / 1e6:,.0f} MB of {rep.remote_total / 1e6:,.0f} MB, nothing written to disk")
+        out.append(f"streamed {rep.fetched / 1e6:,.0f} MB (the streamed repos hold {rep.remote_total / 1e6:,.0f} MB), nothing written to disk")
+    shifts = {}
+    for t in rep.tensors:
+        if t.shift is not None:
+            shifts[round(t.shift, 2)] = shifts.get(round(t.shift, 2), 0) + 1
+    if shifts:
+        out.append("constant shifts, not flagged (a conversion offset, check it is what the converter does): "
+                   + ", ".join(f"{c:+.2f} x{n}" for c, n in sorted(shifts.items())))
     if q:
         bits = sorted({(t.bits, t.group_size) for t in q})
         out.append(f"quantized: {len(q)} tensors, (bits, group) {bits}, median error ratio "
                    f"{sorted(t.ratio for t in q)[len(q) // 2]:.2f}x a clean re-quantization")
     by_layer = {}
     for t in rep.tensors:
-        by_layer.setdefault(layer_of(t.name), []).append(t)
+        by_layer.setdefault(layer_key(t.name), []).append(t)
     layers = sorted(k for k in by_layer if k is not None)
     if layers:
+        multi = len({k[0] for k in layers}) > 1
         out.append("\nflagged tensors per layer")
         for k in layers:
             n = sum(t.flagged for t in by_layer[k])
-            out.append(f"  {k:>3} {'█' * n}{'░' * (len(by_layer[k]) - n)} {n}/{len(by_layer[k])}")
+            out.append(f"  {key_label(k, multi):>12} {'█' * n}{'░' * (len(by_layer[k]) - n)} {n}/{len(by_layer[k])}")
     if flagged:
-        out.append("\nworst tensors")
-        for t in flagged[:top]:
+        out.append("\nflagged tensors")
+        for t in flagged[:FLAG_LIST]:
             out.append(f"  ✗ {t.name}  {'; '.join(t.reasons)}")
+        if len(flagged) > FLAG_LIST:
+            out.append(f"  ... and {len(flagged) - FLAG_LIST} more (use --json)")
     for label, names in (("not in upstream", rep.only_candidate), ("missing from candidate", rep.only_base)):
         if names:
             out.append(f"\n{label} ({len(names)}):")
@@ -521,7 +583,7 @@ class Progress:
     def begin(self, units, stores, layers):
         self.names, self.stores = [u[0] for u in units], stores
         self.status = ["queued"] * len(units)
-        self.scope = "all layers" if layers is None else f"layers {sorted(layers)}"
+        self.scope = describe_layers(layers)
         self.fetched0 = sum(getattr(s, "fetched", 0) for s in stores)
         self.planned = sum(s.size(n) for u in units for s, n in u[1] if hasattr(s, "size"))
         self.t0 = time.monotonic()
@@ -549,17 +611,19 @@ class Progress:
     def grid(self, width):
         groups = {}
         for i, name in enumerate(self.names):
-            groups.setdefault(layer_of(name), []).append(i)
-        keys = sorted(groups, key=lambda k: (k is None, k))
-        block = 4 + max(len(v) for v in groups.values()) + 2
+            groups.setdefault(layer_key(name), []).append(i)
+        keys = sorted(groups, key=lambda k: (k is None, k or ("", 0)))
+        multi = len({k[0] for k in keys if k}) > 1
+        labels = {k: "glb" if k is None else key_label(k, multi) for k in keys}
+        pad = max(len(x) for x in labels.values())
+        block = pad + 1 + max(len(v) for v in groups.values()) + 2
         per_row = max(1, width // block)
         rows = []
         for r in range(0, len(keys), per_row):
             line = ""
             for k in keys[r : r + per_row]:
                 cells = "".join(self.cell(self.status[i]) for i in groups[k])
-                label = "glb" if k is None else str(k)
-                line += f"{label:>3} {cells}" + " " * (block - 4 - len(groups[k]))
+                line += f"{labels[k]:>{pad}} {cells}" + " " * (block - pad - 1 - len(groups[k]))
             rows.append(line.rstrip())
         return rows
 
@@ -583,11 +647,11 @@ class Progress:
             line = line[: -len(f"flagged {bad}")] + self.paint("1;31", f"flagged {bad}")
         out += [line, ""]
         out += self.grid(w)
-        first = next((i for i, n in enumerate(self.names) if layer_of(n) is not None), None)
+        first = next((i for i, n in enumerate(self.names) if layer_key(n) is not None), None)
         if first is not None:
-            mine = layer_of(self.names[first])
+            mine = layer_key(self.names[first])
             order = " ".join(re.sub(r"_proj$", "", n.split(".")[-2] if n.endswith(".weight") else n.split(".")[-1])
-                             for n in self.names if layer_of(n) == mine)
+                             for n in self.names if layer_key(n) == mine)
             out.append(self.paint("2", fit(f"cells: {order}")))
         if self.latest:
             status, name, note = self.latest
@@ -644,7 +708,7 @@ def main(argv=None):
         if args.layers:
             layers = {int(x) for x in args.layers.split(",")}
         elif args.sample:
-            layers = set(pick_layers({layer_of(n) for n in base.names} - {None}, args.sample))
+            layers = sample_keys(base.names, args.sample)
         show = args.progress == "on" or (args.progress == "auto" and sys.stderr.isatty())
         label = lambda spec: "/".join(Path(spec).expanduser().parts[-2:]) if Path(spec).expanduser().is_dir() else spec  # noqa: E731
         progress = Progress(labels=(label(args.base), label(args.candidate))) if show else None
