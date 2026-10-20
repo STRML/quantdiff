@@ -20,7 +20,7 @@ python quantdiff.py --stream --sample 4 \
     --candidate huihui-ai/Qwen2.5-0.5B-Instruct-abliterated-v3
 ```
 
-`--stream` reads repo ids that aren't in your cache with HTTP Range requests: the safetensors header first, then one tensor at a time. Nothing is written to disk, and memory holds the tensors being checked plus `--prefetch-mb` (default 256) fetched ahead. Both the upstream and the candidate stream, so you can vet a quant before you download it. The upstream is pinned to a commit hash and the hash is printed.
+`--stream` reads repo ids that aren't in your cache with HTTP Range requests: the safetensors header first, then one tensor at a time. Nothing is written to disk, and memory holds the tensors being checked plus `--prefetch-mb` (default 256) fetched ahead. Both the upstream and the candidate stream, so you can vet a quant before you download it. On a terminal it draws a live view on stderr: a byte bar with rate and time left, a tensor bar, and one cell per tensor grouped by layer, red where a tensor is flagged. `--progress off` turns it off, and it stays off when stderr isn't a terminal. The upstream is pinned to a commit hash and the hash is printed.
 
 `--sample K` checks K layers spread through the stack, first and last included. `--layers 5,10,20` picks them yourself, and `--global` adds the embeddings and `lm_head`. A sampled run says so in its output, and it only covers the layers it names.
 
