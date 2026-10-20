@@ -28,6 +28,7 @@ Tensors only: tokenizer, chat template and config tampering are not covered.
 import argparse
 import http.client
 import json
+import math
 import os
 import re
 import shutil
@@ -38,7 +39,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -49,7 +50,7 @@ CAST_TOL = 2.0**-8  # relative error a dtype cast (bf16 <-> f16 <-> f32) may int
 VIOL_FRAC = 1e-4  # share of elements past the rounding bound that flags a quantized tensor
 RATIO_MAX = 1.5  # error vs re-quantized upstream
 RANK1_EXCESS = 0.03  # share of a quantized tensor's error in one direction beyond what re-quantizing upstream gives (clean quants: <= 0.01)
-SVD_MAX_ELEMS = 3e8
+SVD_MAX_ELEMS = 3e8  # elements in one 2-D matrix; stacked (expert) tensors are sampled slice by slice
 FLAG_LIST = 60  # flagged tensors printed in full
 SVD_SLICES = 8  # 3-D (stacked expert) tensors: slices sampled for the rank-1 check
 
@@ -192,7 +193,8 @@ class RemoteStore:
                 with self._open(url, first + len(buf), last) as r:
                     if r.status != 206:
                         raise RuntimeError(f"{url} ignored the Range header (HTTP {r.status}); not downloading the whole file")
-                    buf += r.read()
+                    while chunk := r.read(1 << 24):
+                        buf += chunk
             except urllib.error.HTTPError as e:
                 if e.code < 500:
                     raise RuntimeError(f"{url}: HTTP {e.code}") from e
@@ -205,7 +207,7 @@ class RemoteStore:
             if len(buf) == want:
                 with self.lock:
                     self.fetched += want
-                return bytes(buf)
+                return buf
             if len(buf) > want:
                 raise RuntimeError(f"{url}: asked for {want} bytes, got {len(buf)}")
             time.sleep(1 + attempt)
@@ -218,7 +220,7 @@ class RemoteStore:
         url, start, end, dtype, shape = self.index[name]
         if end == start:
             return torch.empty(shape, dtype=dtype)
-        return torch.frombuffer(bytearray(self._range(url, start, end - 1)), dtype=dtype).reshape(shape)
+        return torch.frombuffer(self._range(url, start, end - 1), dtype=dtype).reshape(shape)
 
 
 def cached_dir(spec):
@@ -299,6 +301,54 @@ def match_name(name, base_names, index, by_canon=None):
     return None
 
 
+EXPERT_PARTS = {"gate_proj": ("gate_up_proj", 0), "up_proj": ("gate_up_proj", 1), "down_proj": ("down_proj", None)}
+EXPERT_RE = re.compile(r"^(.*)\.switch_mlp\.(gate_proj|up_proj|down_proj)\.weight$")
+
+
+def match_expert(name, by_canon):
+    """A pack's `...switch_mlp.{gate,up,down}_proj` against upstream's fused `...experts.{gate_up,down}_proj`.
+    Returns (upstream name, half) where half is 0 (gate), 1 (up) or None (down), or None when it doesn't apply."""
+    m = EXPERT_RE.match(name)
+    if not m:
+        return None
+    part, half = EXPERT_PARTS[m.group(2)]
+    target = by_canon.get(canon(f"{m.group(1)}.experts.{part}"))
+    return (target, half) if target else None
+
+
+class FusedHalves:
+    """Upstream's fused experts.gate_up_proj [E, 2I, H] as separate gate and up halves [E, I, H]. The fused tensor is
+    fetched once for both halves (single flight) and the last two are kept."""
+
+    def __init__(self, base):
+        self.base, self.lock, self.cache = base, threading.Lock(), {}
+
+    def size(self, key):
+        real, _ = key
+        return self.base.size(real) // 2 if hasattr(self.base, "size") else 0
+
+    def _full(self, real):
+        with self.lock:
+            fut = self.cache.get(real)
+            mine = fut is None
+            if mine:
+                fut = self.cache[real] = Future()
+                while len(self.cache) > 2:
+                    del self.cache[next(iter(self.cache))]
+        if mine:
+            try:
+                fut.set_result(self.base.get(real))
+            except BaseException as e:  # noqa: BLE001 - hand the failure to every waiter
+                fut.set_exception(e)
+        return fut.result()
+
+    def get(self, key):
+        real, half = key
+        full = self._full(real)
+        n = full.shape[1] // 2
+        return full[:, half * n : (half + 1) * n]
+
+
 def unpack_codes(words, bits):
     """MLX packs `bits`-wide codes little-endian into uint32 words. Returns int codes [..., n]."""
     b = words.contiguous().view(torch.uint8)
@@ -338,7 +388,7 @@ def rel(delta, ref):
 
 def rank1_share(delta):
     """Share of the error's energy in its top singular direction (max over sampled 2-D slices)."""
-    if delta.numel() > SVD_MAX_ELEMS or delta.ndim < 2:
+    if delta.ndim < 2 or math.prod(delta.shape[-2:]) > SVD_MAX_ELEMS:
         return 0.0
     mats = delta.reshape(-1, *delta.shape[-2:])
     step = max(1, len(mats) // SVD_SLICES)
@@ -443,20 +493,25 @@ def audit(base, cand, only=None, layers=None, include_global=False, prefetch_byt
     quant_stems = {n[: -len(".scales")] for n in cand.names if n.endswith(".scales") and n[: -len(".scales")] + ".weight" in cand.names}
     skip = {s + suffix for s in quant_stems for suffix in (".scales", ".biases")}
     pat = re.compile(only) if only else None
-    units, only_cand, matched = [], [], set()
+    units, only_cand, matched, fused = [], [], set(), None
     for name in sorted(cand.names - skip):
         stem = name[: -len(".weight")] if name.endswith(".weight") else None
-        target = match_name(name, base.names, index, by_canon)
+        expert = match_expert(name, by_canon)
+        target = expert[0] if expert else match_name(name, base.names, index, by_canon)
         if target is None:
             only_cand.append(name)
             continue
         matched.add(target)
         if not in_scope(target) or (pat and not pat.search(target)):
             continue
-        fetch = [(base, target), (cand, name)]
+        source, shown = (base, target), target
+        if expert and expert[1] is not None:
+            fused = fused or FusedHalves(base)
+            source, shown = (fused, expert), f"{target}[{'gate' if expert[1] == 0 else 'up'}]"
+        fetch = [source, (cand, name)]
         if stem in quant_stems:
             fetch += [(cand, stem + ".scales"), (cand, stem + ".biases")]
-        units.append((target, fetch))
+        units.append((shown, fetch))
     results = []
     if progress:
         progress.begin(units, (base, cand), layers)
