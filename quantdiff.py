@@ -468,7 +468,22 @@ class ExpertSlice:
 
     def get(self, key):
         name, idx = key
-        return self.cand.get(name)[idx]
+        return take_rows(self.cand.get(name), idx)
+
+
+def _index(t, idx):
+    return t[idx]
+
+
+# torch 2.8 can't index uint16/32/64 tensors ("index_cpu" not implemented); a signed view of the same width can.
+SIGNED_TWIN = {getattr(torch, u): getattr(torch, s) for u, s in (("uint16", "int16"), ("uint32", "int32"), ("uint64", "int64"))
+               if hasattr(torch, u)}
+
+
+def take_rows(t, idx):
+    """t[idx] along the first axis, bit for bit, for any dtype."""
+    signed = SIGNED_TWIN.get(t.dtype)
+    return _index(t, idx) if signed is None else _index(t.view(signed), idx).view(t.dtype)
 
 
 def expert_label(idx):
