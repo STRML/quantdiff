@@ -58,7 +58,7 @@ SVD_SLICES = 8  # 3-D (stacked expert) tensors: slices sampled for the rank-1 ch
 @dataclass
 class TensorResult:
     name: str
-    kind: str  # quant | plain
+    kind: str  # quant | mx | plain
     shape: list
     rel_err: float = 0.0
     bits: int = 0
@@ -119,6 +119,7 @@ SAFETENSORS_DTYPES = {
     "BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32, "F64": torch.float64,
     "I8": torch.int8, "I16": torch.int16, "I32": torch.int32, "I64": torch.int64,
     "U8": torch.uint8, "U16": torch.uint16, "U32": torch.uint32, "U64": torch.uint64, "BOOL": torch.bool,
+    "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2, "F8_E8M0": torch.float8_e8m0fnu,
 }
 
 
@@ -349,6 +350,107 @@ class FusedHalves:
         return full[:, half * n : (half + 1) * n]
 
 
+FP4_VALUES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+BASE_SCALE_SUFFIXES = (".scale", ".weight_scale_inv")  # DeepSeek's release names, and the name its converter reads
+SCALED_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8, torch.uint8)
+
+
+def e8m0_float(s):
+    """An E8M0 scale (stored as float8_e8m0fnu or raw uint8) as the power of two it encodes; other dtypes as is."""
+    if s.dtype in (torch.float8_e8m0fnu, torch.uint8):
+        return torch.exp2(s.contiguous().view(torch.uint8).float() - 127)
+    return s.float()
+
+
+def fp4_values(b):
+    """E2M1 codes packed two a byte, low nibble first (DeepSeek's convert.py and MLX's mxfp4 agree)."""
+    b = b.contiguous().view(torch.uint8)
+    return FP4_VALUES[torch.stack([b & 0xF, b >> 4], -1).reshape(*b.shape[:-1], -1).long()]
+
+
+def decode_base(w, scale):
+    """An upstream weight stored with a scale tensor, as float32. FP4 (int8, two codes a byte) carries one scale per
+    32 inputs; FP8 carries one per block, whose size the two shapes give (DeepSeek-V4 uses 32x32 and 128x128)."""
+    s = e8m0_float(scale)
+    if w.dtype in (torch.int8, torch.uint8) and s.shape[-1] * 32 == w.shape[-1] * 2:
+        v = fp4_values(w)
+        return (v.reshape(*v.shape[:-1], -1, 32) * s[..., None]).reshape(v.shape)
+    bo, bi = w.shape[-2] // s.shape[-2], w.shape[-1] // s.shape[-1]
+    return w.float() * s.repeat_interleave(bo, -2).repeat_interleave(bi, -1)
+
+
+def scale_of(name, names):
+    """The scale tensor stored beside an upstream weight, if any."""
+    if not name.endswith(".weight"):
+        return None
+    stem = name[: -len(".weight")]
+    return next((stem + s for s in BASE_SCALE_SUFFIXES if stem + s in names), None)
+
+
+class DecodedBase:
+    """Upstream with block-scaled weights (FP8, FP4) decoded to float and their scale tensors folded in, plus one
+    virtual stacked tensor per group of per-expert tensors (`...experts.{e}.w1.weight` -> `...experts.w1.weight`)
+    so a pack that stacks its experts matches by name."""
+
+    EXPERT_RE = re.compile(r"^(.*\.experts)\.(\d+)\.(.+)$")
+
+    def __init__(self, base):
+        self.base = base
+        scales = {s for n in base.names if (s := scale_of(n, base.names))}
+        self.scale_for = {n: scale_of(n, base.names) for n in base.names - scales}
+        self.experts = {}
+        for n in self.scale_for:
+            m = self.EXPERT_RE.match(n)
+            if m:
+                self.experts.setdefault(f"{m.group(1)}.{m.group(3)}", []).append(int(m.group(2)))
+        for idx in self.experts.values():
+            idx.sort()
+        self.names = set(self.scale_for) | set(self.experts)
+
+    def members(self, name, idx=None):
+        """The upstream tensors a name stands for, scales included. `idx` picks experts of a virtual stacked name."""
+        if name in self.experts:
+            head, part = name.rsplit(".experts.", 1)
+            names = [f"{head}.experts.{e}.{part}" for e in (self.experts[name] if idx is None else idx)]
+        else:
+            names = [name]
+        return names + [s for n in names if (s := self.scale_for.get(n))]
+
+    def size(self, key):
+        name, idx = key if isinstance(key, tuple) else (key, None)
+        return sum(self.base.size(n) for n in self.members(name, idx)) if hasattr(self.base, "size") else 0
+
+    def _one(self, name):
+        w = self.base.get(name)
+        s = self.scale_for.get(name)
+        return decode_base(w, self.base.get(s)) if s and w.dtype in SCALED_DTYPES else w
+
+    def get(self, key):
+        name, idx = key if isinstance(key, tuple) else (key, None)
+        if idx is None:
+            return self._one(name)
+        head, part = name.rsplit(".experts.", 1)
+        return torch.stack([self._one(f"{head}.experts.{e}.{part}").float() for e in idx])
+
+
+class ExpertSlice:
+    """The chosen experts of a pack's stacked tensor. The whole tensor is read; only the slices are kept."""
+
+    def __init__(self, cand):
+        self.cand = cand
+
+    def size(self, key):
+        return self.cand.size(key[0]) if hasattr(self.cand, "size") else 0
+
+    def get(self, key):
+        name, idx = key
+        return self.cand.get(name)[idx]
+
+
+def expert_label(idx):
+    return f"{idx[0]}-{idx[-1]}" if idx == list(range(idx[0], idx[-1] + 1)) else ",".join(map(str, idx))
+
+
 def unpack_codes(words, bits):
     """MLX packs `bits`-wide codes little-endian into uint32 words. Returns int codes [..., n]."""
     b = words.contiguous().view(torch.uint8)
@@ -435,6 +537,55 @@ def check_quant(name, base_w, words, scales, biases):
     return res
 
 
+MX_TOP = {8: 448.0, 4: 6.0}  # largest E4M3 and E2M1 magnitudes
+
+
+def mx_dequantize(words, scales, bits):
+    """MLX mxfp8 / mxfp4: E4M3 bytes or E2M1 nibbles in uint32 words, one E8M0 scale per 32."""
+    b = words.contiguous().view(torch.uint8)
+    v = b.view(torch.float8_e4m3fn).float() if bits == 8 else fp4_values(b)
+    return (v.reshape(*v.shape[:-1], -1, 32) * e8m0_float(scales)[..., None]).reshape(v.shape)
+
+
+def mx_requantize(w, bits):
+    """Power-of-two scale per 32 with no clipping, then round to the element format; the noise floor for an mx quant."""
+    g = w.float().reshape(*w.shape[:-1], -1, 32)
+    s = torch.exp2(torch.ceil(torch.log2(g.abs().amax(-1, keepdim=True).clamp_min(1e-30) / MX_TOP[bits])))
+    x = g / s
+    q = x.to(torch.float8_e4m3fn).float() if bits == 8 else fp4_round(x)
+    return (q * s).reshape(w.shape)
+
+
+FP4_MAGS = FP4_VALUES[:8]
+FP4_MIDS = (FP4_MAGS[1:] + FP4_MAGS[:-1]) / 2
+
+
+def fp4_round(x):
+    """Nearest E2M1 value, without a per-element table (a [N, 16] distance matrix is too big for expert stacks)."""
+    return torch.sign(x) * FP4_MAGS[torch.bucketize(x.abs(), FP4_MIDS)]
+
+
+def check_mx(name, base_w, words, scales):
+    in_dim = base_w.shape[-1]
+    gs = in_dim // scales.shape[-1]
+    bits = words.shape[-1] * 32 // in_dim
+    res = TensorResult(name, "mx", list(base_w.shape), bits=bits, group_size=gs)
+    if bits not in MX_TOP or gs != 32 or gs * scales.shape[-1] != in_dim:
+        res.reasons.append(f"layout does not decode as mxfp (bits={bits}, group_size={gs})")
+        return res
+    delta = mx_dequantize(words, scales, bits) - base_w.float()
+    ref_delta = mx_requantize(base_w, bits) - base_w.float()
+    res.rel_err, floor = rel(delta, base_w), rel(ref_delta, base_w)
+    # An upstream already on the format's grid (FP8 into mxfp8) round-trips exactly: no floor, and no error either.
+    res.ratio = res.rel_err / floor if floor else (0.0 if res.rel_err == 0 else float("inf"))
+    res.rank1, res.rank1_ref = rank1_share(delta), rank1_share(ref_delta)
+    if res.ratio > RATIO_MAX:
+        res.reasons.append(f"error {res.ratio:.1f}x a clean re-quantization")
+    if res.rank1 - res.rank1_ref > RANK1_EXCESS:
+        res.reasons.append(f"{res.rank1:.0%} of the error is one direction, {res.rank1_ref:.0%} for a clean quant")
+    return res
+
+
 def check_plain(name, base_w, cand_w):
     res = TensorResult(name, "plain", list(base_w.shape))
     if base_w.shape != cand_w.shape:
@@ -478,10 +629,12 @@ def stream_units(units, budget, workers=8, on_submit=None):
             yield u, tensors
 
 
-def audit(base, cand, only=None, layers=None, include_global=False, prefetch_bytes=256 << 20, progress=None):
-    """`base` and `cand` are stores or directories. `layers` limits the check to those layer indices."""
-    base = base if hasattr(base, "get") else Store(base)
+def audit(base, cand, only=None, layers=None, include_global=False, prefetch_bytes=256 << 20, progress=None, experts=8):
+    """`base` and `cand` are stores or directories. `layers` limits the check to those layer indices. `experts` is
+    how many experts of a stacked pack tensor are compared when upstream stores one tensor per expert."""
+    raw_base = base if hasattr(base, "get") else Store(base)
     cand = cand if hasattr(cand, "get") else Store(cand)
+    base, sliced = DecodedBase(raw_base), ExpertSlice(cand)
 
     def in_scope(name):
         if layers is None:
@@ -502,29 +655,48 @@ def audit(base, cand, only=None, layers=None, include_global=False, prefetch_byt
             only_cand.append(name)
             continue
         matched.add(target)
+        matched.update(base.members(target))
         if not in_scope(target) or (pat and not pat.search(target)):
             continue
+        cand_src = cand
         source, shown = (base, target), target
         if expert and expert[1] is not None:
             fused = fused or FusedHalves(base)
             source, shown = (fused, expert), f"{target}[{'gate' if expert[1] == 0 else 'up'}]"
-        fetch = [source, (cand, name)]
+        elif target in base.experts:
+            idx = pick_layers(base.experts[target], experts)
+            source, shown, cand_src = (base, (target, idx)), f"{target}[experts {expert_label(idx)}]", sliced
+        key = (lambda n: (n, idx)) if cand_src is sliced else (lambda n: n)
+        fetch = [source, (cand_src, key(name))]
         if stem in quant_stems:
-            fetch += [(cand, stem + ".scales"), (cand, stem + ".biases")]
+            fetch.append((cand_src, key(stem + ".scales")))
+            if stem + ".biases" in cand.names:
+                fetch.append((cand_src, key(stem + ".biases")))
         units.append((shown, fetch))
+    # A pack that keeps experts unstacked matched them one by one; their virtual stacked name is covered too.
+    matched.update(v for v in base.experts if set(base.members(v)) <= matched)
     results = []
     if progress:
-        progress.begin(units, (base, cand), layers)
+        progress.begin(units, (raw_base, cand), layers)
     for i, ((target, fetch), tensors) in enumerate(stream_units(units, prefetch_bytes, on_submit=progress and progress.submitted)):
-        results.append(check_quant(target, *tensors) if len(tensors) == 4 else check_plain(target, *tensors))
+        results.append(check_unit(target, tensors))
         if progress:
             progress.done(i, results[-1])
     if progress:
         progress.finish()
     return Report(results, only_cand, sorted(n for n in base.names - matched if in_scope(n)),
                   None if layers is None else sorted(layers, key=str),
-                  sum(getattr(s, "fetched", 0) for s in (base, cand)),
-                  sum(getattr(s, "total_bytes", 0) for s in (base, cand)))
+                  sum(getattr(s, "fetched", 0) for s in (raw_base, cand)),
+                  sum(getattr(s, "total_bytes", 0) for s in (raw_base, cand)))
+
+
+def check_unit(target, tensors):
+    """Affine quant (codes, scales, biases), MLX microscaling (codes, uint8 E8M0 scales), else a plain tensor."""
+    if len(tensors) == 4:
+        return check_quant(target, *tensors)
+    if len(tensors) == 3:
+        return check_mx(target, *tensors)
+    return check_plain(target, *tensors)
 
 
 def layer_key(name):
@@ -751,6 +923,7 @@ def main(argv=None):
     ap.add_argument("--progress", choices=["auto", "on", "off"], default="auto", help="live terminal view on stderr (auto: only when stderr is a terminal)")
     ap.add_argument("--global", dest="include_global", action="store_true", help="with --sample/--layers, also check tensors outside the layers (embeddings, lm_head, final norm)")
     ap.add_argument("--only", help="regex on upstream tensor names; others are skipped")
+    ap.add_argument("--experts", type=int, default=8, metavar="K", help="when upstream stores one tensor per expert and the pack stacks them, compare K experts spread through the stack (default 8)")
     ap.add_argument("--json", help="write the full per-tensor report here")
     args = ap.parse_args(argv)
     try:
@@ -767,7 +940,7 @@ def main(argv=None):
         show = args.progress == "on" or (args.progress == "auto" and sys.stderr.isatty())
         label = lambda spec: "/".join(Path(spec).expanduser().parts[-2:]) if Path(spec).expanduser().is_dir() else spec  # noqa: E731
         progress = Progress(labels=(label(args.base), label(args.candidate))) if show else None
-        rep = audit(base, cand, args.only, layers, args.include_global, args.prefetch_mb << 20, progress)
+        rep = audit(base, cand, args.only, layers, args.include_global, args.prefetch_mb << 20, progress, args.experts)
     except Exception as e:  # noqa: BLE001
         print(f"quantdiff: {e}", file=sys.stderr)
         return 2
