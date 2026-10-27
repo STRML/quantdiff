@@ -710,3 +710,25 @@ def test_experts_must_be_positive():
     with pytest.raises(SystemExit) as e:
         qd.main(["--base", "x", "--candidate", "y", "--experts", "0"])
     assert e.value.code == 2
+
+
+def test_expert_slices_of_unsigned_codes_keep_their_bits(monkeypatch):
+    """torch 2.8 can't index uint32 tensors ("index_cpu" not implemented for 'UInt32'); slicing must not depend on it."""
+    words = torch.arange(4 * 3 * 2, dtype=torch.int64).mul(0x9E3779B1).remainder(2**32).to(torch.int64)
+    words = words.to(torch.int32).view(torch.uint32).reshape(4, 3, 2)
+
+    class Cand:
+        names = {"w"}
+
+        def get(self, name):
+            return words
+
+    def no_unsigned_index(t, idx):
+        if t.dtype in (torch.uint16, torch.uint32, torch.uint64):
+            raise NotImplementedError('"index_cpu" not implemented for unsigned')
+        return t[idx]
+
+    monkeypatch.setattr(qd, "_index", no_unsigned_index)
+    got = qd.ExpertSlice(Cand()).get(("w", [0, 3]))
+    assert got.dtype == torch.uint32
+    assert torch.equal(got.view(torch.int32), words.view(torch.int32)[[0, 3]])
