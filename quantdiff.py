@@ -108,19 +108,27 @@ class Store:
                     self.where[k] = f
         self.names = set(self.where)
 
-    def get(self, name):
+    def _handle(self, name):
         f = self.where[name]
         if f not in self.handles:
             self.handles[f] = safe_open(str(f), framework="pt")
-        return self.handles[f].get_tensor(name)
+        return self.handles[f]
+
+    def get(self, name):
+        return self._handle(name).get_tensor(name)
+
+    def shape(self, name):
+        return list(self._handle(name).get_slice(name).get_shape())
 
 
 SAFETENSORS_DTYPES = {
     "BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32, "F64": torch.float64,
     "I8": torch.int8, "I16": torch.int16, "I32": torch.int32, "I64": torch.int64,
     "U8": torch.uint8, "U16": torch.uint16, "U32": torch.uint32, "U64": torch.uint64, "BOOL": torch.bool,
-    "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2, "F8_E8M0": torch.float8_e8m0fnu,
 }
+# Only torch builds that have the FP8 dtypes can read FP8 upstreams; older ones still run every other check.
+SAFETENSORS_DTYPES.update({k: getattr(torch, v) for k, v in (("F8_E4M3", "float8_e4m3fn"), ("F8_E5M2", "float8_e5m2"),
+                                                            ("F8_E8M0", "float8_e8m0fnu")) if hasattr(torch, v)})
 
 
 class _DropAuthOffHost(urllib.request.HTTPRedirectHandler):
@@ -216,6 +224,9 @@ class RemoteStore:
 
     def size(self, name):
         return self.index[name][2] - self.index[name][1]
+
+    def shape(self, name):
+        return list(self.index[name][4])
 
     def get(self, name):
         url, start, end, dtype, shape = self.index[name]
@@ -352,12 +363,14 @@ class FusedHalves:
 
 FP4_VALUES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
 BASE_SCALE_SUFFIXES = (".scale", ".weight_scale_inv")  # DeepSeek's release names, and the name its converter reads
-SCALED_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8, torch.uint8)
+FP8_DTYPES = tuple(getattr(torch, n) for n in ("float8_e4m3fn", "float8_e5m2") if hasattr(torch, n))
+E8M0_DTYPES = tuple(getattr(torch, n) for n in ("float8_e8m0fnu",) if hasattr(torch, n)) + (torch.uint8,)
+SCALED_DTYPES = FP8_DTYPES + (torch.int8, torch.uint8)
 
 
 def e8m0_float(s):
     """An E8M0 scale (stored as float8_e8m0fnu or raw uint8) as the power of two it encodes; other dtypes as is."""
-    if s.dtype in (torch.float8_e8m0fnu, torch.uint8):
+    if s.dtype in E8M0_DTYPES:
         return torch.exp2(s.contiguous().view(torch.uint8).float() - 127)
     return s.float()
 
@@ -370,13 +383,23 @@ def fp4_values(b):
 
 def decode_base(w, scale):
     """An upstream weight stored with a scale tensor, as float32. FP4 (int8, two codes a byte) carries one scale per
-    32 inputs; FP8 carries one per block, whose size the two shapes give (DeepSeek-V4 uses 32x32 and 128x128)."""
+    32 inputs; FP8 carries one per square block (DeepSeek-V4 uses 32x32 and 128x128, DeepSeek-V3 128x128)."""
     s = e8m0_float(scale)
     if w.dtype in (torch.int8, torch.uint8) and s.shape[-1] * 32 == w.shape[-1] * 2:
         v = fp4_values(w)
         return (v.reshape(*v.shape[:-1], -1, 32) * s[..., None]).reshape(v.shape)
-    bo, bi = w.shape[-2] // s.shape[-2], w.shape[-1] // s.shape[-1]
-    return w.float() * s.repeat_interleave(bo, -2).repeat_interleave(bi, -1)
+    rows, cols = w.shape[-2:]
+    block = fp8_block_size(rows, cols, *s.shape[-2:])
+    return w.float() * s.repeat_interleave(block, -2).repeat_interleave(block, -1)[..., :rows, :cols]
+
+
+def fp8_block_size(rows, cols, srows, scols):
+    """The square block whose grid, last block padded (ceil), gives the scale's shape: a 576-row weight in 128-row
+    blocks has 5 scale rows, so dividing the shapes would give the wrong size."""
+    for b in (128, 32, 64, 256, 16):
+        if -(-rows // b) == srows and -(-cols // b) == scols:
+            return b
+    raise ValueError(f"no square block maps a [{rows}, {cols}] weight to a [{srows}, {scols}] scale")
 
 
 def scale_of(name, names):
@@ -646,7 +669,7 @@ def audit(base, cand, only=None, layers=None, include_global=False, prefetch_byt
     quant_stems = {n[: -len(".scales")] for n in cand.names if n.endswith(".scales") and n[: -len(".scales")] + ".weight" in cand.names}
     skip = {s + suffix for s in quant_stems for suffix in (".scales", ".biases")}
     pat = re.compile(only) if only else None
-    units, only_cand, matched, fused = [], [], set(), None
+    units, only_cand, matched, fused, early = [], [], set(), None, []
     for name in sorted(cand.names - skip):
         stem = name[: -len(".weight")] if name.endswith(".weight") else None
         expert = match_expert(name, by_canon)
@@ -664,6 +687,12 @@ def audit(base, cand, only=None, layers=None, include_global=False, prefetch_byt
             fused = fused or FusedHalves(base)
             source, shown = (fused, expert), f"{target}[{'gate' if expert[1] == 0 else 'up'}]"
         elif target in base.experts:
+            have, want = cand.shape(name)[0], len(base.experts[target])
+            if have != want:
+                bad = TensorResult(target, "quant" if stem in quant_stems else "plain", cand.shape(name))
+                bad.reasons.append(f"pack stacks {have} experts, upstream has {want}")
+                early.append(bad)
+                continue
             idx = pick_layers(base.experts[target], experts)
             source, shown, cand_src = (base, (target, idx)), f"{target}[experts {expert_label(idx)}]", sliced
         key = (lambda n: (n, idx)) if cand_src is sliced else (lambda n: n)
@@ -675,7 +704,7 @@ def audit(base, cand, only=None, layers=None, include_global=False, prefetch_byt
         units.append((shown, fetch))
     # A pack that keeps experts unstacked matched them one by one; their virtual stacked name is covered too.
     matched.update(v for v in base.experts if set(base.members(v)) <= matched)
-    results = []
+    results = list(early)
     if progress:
         progress.begin(units, (raw_base, cand), layers)
     for i, ((target, fetch), tensors) in enumerate(stream_units(units, prefetch_bytes, on_submit=progress and progress.submitted)):

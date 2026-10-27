@@ -646,3 +646,27 @@ def test_tampered_microscaling_tensor_is_flagged(tmp_path, bits):
 def test_fp4_nibble_order_low_first():
     packed, scale, deq = fp4_rows(rand(8, 64))
     assert torch.equal(qd.decode_base(packed, scale), deq)
+
+
+def test_fp8_scale_grid_padded_with_ceil_decodes(tmp_path):
+    """DeepSeek-V3's converter pads the last block: a 48-row weight with 32-row blocks has 2 scale rows."""
+    w = rand(48, 128)
+    padded = torch.cat([w, torch.zeros(16, 128, dtype=w.dtype)])
+    q, s, deq = fp8_block(padded)
+    q, deq = q[:48].contiguous(), deq[:48]
+    assert torch.equal(qd.decode_base(q, s), deq)
+    aq, asc, ab = quantize(deq.to(torch.bfloat16), 4, 64)
+    base = {"layers.0.attn.wo.weight": q, "layers.0.attn.wo.scale": s}
+    cand = {"layers.0.attn.wo.weight": aq, "layers.0.attn.wo.scales": asc, "layers.0.attn.wo.biases": ab}
+    assert run(tmp_path, base, cand).verdict == "NO FINDINGS"
+
+
+def test_pack_stacking_a_different_expert_count_is_flagged_not_a_crash(tmp_path):
+    base, cand = deepseek_pair(n_experts=4)
+    stem = "language_model.layers.0.ffn.experts.w1"
+    for suffix in (".weight", ".scales", ".biases"):
+        cand[stem + suffix] = cand[stem + suffix][:3].contiguous()
+    rep = run(tmp_path, base, cand)
+    flagged = [t for t in rep.tensors if t.flagged]
+    assert [t.name for t in flagged] == ["layers.0.ffn.experts.w1.weight"]
+    assert "3 experts" in flagged[0].reasons[0] and "4" in flagged[0].reasons[0]
