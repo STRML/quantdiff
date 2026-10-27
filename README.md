@@ -44,6 +44,19 @@ whole model        tensors the candidate adds are flagged, tensors it lacks are 
 
 Rounding noise spreads over many directions. A refusal-direction edit is rank 1.
 
+## Block-scaled upstreams and stacked experts
+
+DeepSeek-V4 ships its weights the way it runs them, so the upstream is decoded before the diff:
+
+| Upstream tensor | Scale beside it | Decoded as |
+|---|---|---|
+| `F8_E4M3` | `.scale` or `.weight_scale_inv`, one per block (32x32 or 128x128, from the shapes) | FP8 x scale |
+| `I8` holding two FP4 E2M1 codes a byte, low nibble first | one E8M0 scale per 32 inputs | FP4 x scale |
+
+Scale tensors are folded into their weight and never listed as missing. Upstream stores one tensor per expert (`experts.7.w1.weight`); a pack that stacks them (`experts.w1.weight`, `[E, out, in]`) matches a virtual stacked tensor, and `--experts K` (default 8) compares K experts spread through the stack, first and last included. The result names them: `layers.3.ffn.experts.w1.weight[experts 0,55,110,...]`.
+
+MLX's microscaling modes are read too: `mxfp8` and `mxfp4` (uint32 codes, a uint8 E8M0 scale per 32, no biases). They're judged on error against a power-of-two re-quantization of upstream and on the one-direction share. An FP8 upstream lands on the mxfp8 grid exactly, so a clean copy has zero error.
+
 ## Measured
 
 Qwen2.5-0.5B-Instruct, 2026-10-20:
@@ -62,8 +75,9 @@ No findings means no tampering this method can see. It is not a safety certifica
 - The thresholds were set on one real 4-bit MLX quant. Mixed-bit packs, imatrix-tuned quants, GGUF and larger models are untested, so recalibrate before you trust it.
 - The upstream must be the exact revision the candidate was made from. A different revision flags everything.
 - A sample misses edits in the layers it skips. Four layers caught this abliteration because it touches nearly every layer. A backdoor confined to a few layers needs `--layers` aimed at them or a full run.
-- Stacked mixture-of-experts tensors match by name only. A repo that re-stacks the experts reports them as missing.
-- Safetensors only. NVFP4 and W4A8 files are not read.
+- Stacked mixture-of-experts tensors match by name: upstream's fused `experts.gate_up_proj`, or one tensor per expert stacked in order. A repo that reorders the experts flags them.
+- With `--experts K`, the experts it skips are unchecked, the same way `--sample` skips layers.
+- Safetensors only. NVFP4, MXFP8 and W4A8 upstreams are not read (DeepSeek's FP8 and FP4 are).
 - Tokenizer, chat template and config tampering are out of scope.
 
 ## Tests

@@ -512,3 +512,201 @@ def test_rank1_check_runs_on_a_stacked_tensor_whose_total_size_is_over_the_cap(m
     monkeypatch.setattr(qd, "SVD_MAX_ELEMS", 300)  # one slice (256) fits, the stack (1024) does not
     assert stacked.numel() > 300 >= 16 * 16
     assert qd.rank1_share(stacked) > 0.99
+
+
+# DeepSeek-V4-style upstream: FP8 E4M3 weights with E8M0 block scales, FP4 E2M1 experts (two codes per int8 byte,
+# low nibble first) with an E8M0 scale per 32 inputs, one tensor per expert. Packs stack the experts and may ship
+# MLX's microscaling modes (mxfp8 / mxfp4: uint32 codes, uint8 E8M0 scales per 32, no biases).
+
+FP4_VALUES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+
+
+def e8m0(exponent):
+    """Unbiased power-of-two exponents -> an E8M0 tensor (bias 127)."""
+    return (exponent.to(torch.int16) + 127).to(torch.uint8).view(torch.float8_e8m0fnu)
+
+
+def pow2_scale(amax, top):
+    """Smallest power of two s with amax / s <= top, as (s, exponent)."""
+    exp = torch.ceil(torch.log2(amax.float().clamp_min(1e-30) / top))
+    return torch.exp2(exp), exp
+
+
+def fp8_block(w, block=32):
+    """[O, I] -> (F8_E4M3 weight, E8M0 scale [O/block, I/block], the float values it decodes to)."""
+    o, i = w.shape
+    g = w.float().reshape(o // block, block, i // block, block)
+    s, exp = pow2_scale(g.abs().amax((1, 3)), 448.0)
+    q = (g / s[:, None, :, None]).to(torch.float8_e4m3fn)
+    deq = (q.float() * s[:, None, :, None]).reshape(o, i)
+    return q.reshape(o, i), e8m0(exp), deq
+
+
+def fp4_codes(x):
+    """Nearest E2M1 code (0..15) for each value of x, already divided by its scale."""
+    return (x[..., None] - FP4_VALUES).abs().argmin(-1).to(torch.uint8)
+
+
+def fp4_rows(w, gs=32):
+    """[O, I] -> (int8 [O, I/2] two codes a byte, E8M0 scale [O, I/gs], decoded values)."""
+    o, i = w.shape
+    g = w.float().reshape(o, i // gs, gs)
+    s, exp = pow2_scale(g.abs().amax(-1), 6.0)
+    codes = fp4_codes(g / s[..., None]).reshape(o, i)
+    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).view(torch.int8)
+    deq = (FP4_VALUES[codes.long()].reshape(o, i // gs, gs) * s[..., None]).reshape(o, i)
+    return packed, e8m0(exp), deq
+
+
+def mx_candidate(w, bits):
+    """MLX microscaling quant of float w [O, I]: uint32 codes, uint8 E8M0 scales per 32, no biases."""
+    o, i = w.shape
+    g = w.float().reshape(o, i // 32, 32)
+    top = 448.0 if bits == 8 else 6.0
+    s, exp = pow2_scale(g.abs().amax(-1), top)
+    x = g / s[..., None]
+    if bits == 8:
+        byts = x.to(torch.float8_e4m3fn).view(torch.uint8).reshape(o, i)
+    else:
+        codes = fp4_codes(x).reshape(o, i)
+        byts = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return byts.contiguous().view(torch.int32).view(torch.uint32), (exp.to(torch.int16) + 127).to(torch.uint8)
+
+
+def rank1_tamper(w, strength=0.9):
+    r = torch.randn(w.shape[-1], generator=GEN)
+    r /= r.norm()
+    return w - strength * (w @ r)[..., None] * r
+
+
+def deepseek_pair(n_experts=4, inter=64, hidden=128, tamper_expert=None, mx=None, tamper_mx=False):
+    """Upstream in DeepSeek's release layout; the pack in an MLX layout made from the decoded upstream."""
+    base, cand = {}, {}
+    wq = rand(64, hidden)
+    q, s, deq = fp8_block(wq)
+    base["layers.0.attn.wq_a.weight"], base["layers.0.attn.wq_a.scale"] = q, s
+    if mx:
+        src = rank1_tamper(deq) if tamper_mx else deq
+        cand["language_model.layers.0.attn.wq_a.weight"], cand["language_model.layers.0.attn.wq_a.scales"] = mx_candidate(src, mx)
+    else:
+        aq, asc, ab = quantize(deq.to(torch.bfloat16), 4, 64)
+        cand["language_model.layers.0.attn.wq_a.weight"] = aq
+        cand["language_model.layers.0.attn.wq_a.scales"], cand["language_model.layers.0.attn.wq_a.biases"] = asc, ab
+    norm = rand(hidden) + 1
+    base["layers.0.attn_norm.weight"], cand["language_model.layers.0.attn_norm.weight"] = norm, norm.clone()
+    decoded = []
+    for e in range(n_experts):
+        packed, sc, d = fp4_rows(rand(inter, hidden))
+        base[f"layers.0.ffn.experts.{e}.w1.weight"], base[f"layers.0.ffn.experts.{e}.w1.scale"] = packed, sc
+        decoded.append(rank1_tamper(d) if e == tamper_expert else d)
+    sq, ss, sb = quantize_stacked(torch.stack(decoded).to(torch.bfloat16), bits=3, gs=64)
+    stem = "language_model.layers.0.ffn.experts.w1"
+    cand[stem + ".weight"], cand[stem + ".scales"], cand[stem + ".biases"] = sq, ss, sb
+    return base, cand
+
+
+def test_fp8_and_fp4_upstream_against_an_affine_pack_with_stacked_experts_is_clean(tmp_path):
+    base, cand = deepseek_pair()
+    rep = run(tmp_path, base, cand)
+    assert rep.verdict == "NO FINDINGS", (rep.flagged_names(), rep.only_candidate, rep.only_base)
+    assert rep.only_base == []  # block scales and the per-expert tensors are all accounted for
+    assert sorted(t.name for t in rep.tensors) == sorted([
+        "layers.0.attn.wq_a.weight", "layers.0.attn_norm.weight", "layers.0.ffn.experts.w1.weight[experts 0-3]"])
+
+
+def test_one_tampered_expert_in_the_stack_is_flagged(tmp_path):
+    base, cand = deepseek_pair(tamper_expert=2)
+    rep = run(tmp_path, base, cand)
+    assert rep.flagged_names() == ["layers.0.ffn.experts.w1.weight[experts 0-3]"]
+
+
+def test_expert_sample_takes_spread_slices_and_names_them(tmp_path):
+    base, cand = deepseek_pair(n_experts=16)
+    rep = run(tmp_path, base, cand, experts=4)
+    assert rep.verdict == "NO FINDINGS", rep.flagged_names()
+    assert [t.name for t in rep.tensors if "experts" in t.name] == ["layers.0.ffn.experts.w1.weight[experts 0,5,10,15]"]
+
+
+@pytest.mark.parametrize("bits", [8, 4])
+def test_mlx_microscaling_pack_against_fp8_upstream_is_clean(tmp_path, bits):
+    base, cand = deepseek_pair(mx=bits)
+    rep = run(tmp_path, base, cand)
+    assert rep.verdict == "NO FINDINGS", (rep.flagged_names(), rep.only_candidate)
+    wq = next(t for t in rep.tensors if t.name == "layers.0.attn.wq_a.weight")
+    assert wq.kind == "mx" and wq.bits == bits and wq.group_size == 32
+
+
+@pytest.mark.parametrize("bits", [8, 4])
+def test_tampered_microscaling_tensor_is_flagged(tmp_path, bits):
+    base, cand = deepseek_pair(mx=bits, tamper_mx=True)
+    rep = run(tmp_path, base, cand)
+    assert rep.flagged_names() == ["layers.0.attn.wq_a.weight"]
+
+
+def test_fp4_nibble_order_low_first():
+    packed, scale, deq = fp4_rows(rand(8, 64))
+    assert torch.equal(qd.decode_base(packed, scale), deq)
+
+
+def test_fp8_scale_grid_padded_with_ceil_decodes(tmp_path):
+    """DeepSeek-V3's converter pads the last block: a 48-row weight with 32-row blocks has 2 scale rows."""
+    w = rand(48, 128)
+    padded = torch.cat([w, torch.zeros(16, 128, dtype=w.dtype)])
+    q, s, deq = fp8_block(padded)
+    q, deq = q[:48].contiguous(), deq[:48]
+    assert torch.equal(qd.decode_base(q, s), deq)
+    aq, asc, ab = quantize(deq.to(torch.bfloat16), 4, 64)
+    base = {"layers.0.attn.wo.weight": q, "layers.0.attn.wo.scale": s}
+    cand = {"layers.0.attn.wo.weight": aq, "layers.0.attn.wo.scales": asc, "layers.0.attn.wo.biases": ab}
+    assert run(tmp_path, base, cand).verdict == "NO FINDINGS"
+
+
+def test_pack_stacking_a_different_expert_count_is_flagged_not_a_crash(tmp_path):
+    base, cand = deepseek_pair(n_experts=4)
+    stem = "language_model.layers.0.ffn.experts.w1"
+    for suffix in (".weight", ".scales", ".biases"):
+        cand[stem + suffix] = cand[stem + suffix][:3].contiguous()
+    rep = run(tmp_path, base, cand)
+    flagged = [t for t in rep.tensors if t.flagged]
+    assert [t.name for t in flagged] == ["layers.0.ffn.experts.w1.weight"]
+    assert "3 experts" in flagged[0].reasons[0] and "4" in flagged[0].reasons[0]
+
+
+def test_local_dirs_read_one_unit_at_a_time(tmp_path, monkeypatch):
+    """Local stores have no byte sizes, so the prefetch budget can't bound them: they must not be read ahead."""
+    base = {f"model.layers.{i}.input_layernorm.weight": rand(256) + 1 for i in range(20)}
+    calls, at_first_check = [], []
+    real_get, real_check = qd.Store.get, qd.check_unit
+    monkeypatch.setattr(qd.Store, "get", lambda self, n: calls.append(n) or real_get(self, n))
+    monkeypatch.setattr(qd, "check_unit", lambda t, ts: at_first_check.append(len(calls)) or real_check(t, ts))
+    run(tmp_path, base, {k: v.clone() for k, v in base.items()})
+    assert at_first_check[0] == 2  # this unit's upstream and candidate tensors, nothing ahead
+
+
+def test_fp8_blocks_with_distinct_exponents_decode_per_block():
+    w = rand(256, 256).float()
+    w *= torch.exp2(torch.arange(-6, 10).float()).repeat_interleave(16)[:, None]  # every 32-row block its own scale
+    q, s, deq = fp8_block(w.to(torch.bfloat16), block=128)
+    assert s.view(torch.uint8).unique().numel() > 1
+    assert torch.equal(qd.decode_base(q, s), deq)
+
+
+def test_sampled_experts_are_named_in_the_verdict(tmp_path):
+    base, cand = deepseek_pair(n_experts=16)
+    out = qd.render(run(tmp_path, base, cand, experts=4))
+    assert "experts: 4 of 16" in out and "not a full result" in out
+
+
+def test_nan_in_a_microscaling_tensor_is_flagged_not_a_crash():
+    deq = fp8_block(rand(64, 128))[2]
+    words, scales = mx_candidate(deq, 8)
+    b = words.view(torch.uint8).clone()
+    b[0, 0] = 0x7F  # E4M3 NaN
+    res = qd.check_mx("t", deq, b.view(torch.uint32), scales)
+    assert res.flagged and "not finite" in res.reasons[0]
+
+
+def test_experts_must_be_positive():
+    with pytest.raises(SystemExit) as e:
+        qd.main(["--base", "x", "--candidate", "y", "--experts", "0"])
+    assert e.value.code == 2
