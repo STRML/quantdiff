@@ -670,3 +670,43 @@ def test_pack_stacking_a_different_expert_count_is_flagged_not_a_crash(tmp_path)
     flagged = [t for t in rep.tensors if t.flagged]
     assert [t.name for t in flagged] == ["layers.0.ffn.experts.w1.weight"]
     assert "3 experts" in flagged[0].reasons[0] and "4" in flagged[0].reasons[0]
+
+
+def test_local_dirs_read_one_unit_at_a_time(tmp_path, monkeypatch):
+    """Local stores have no byte sizes, so the prefetch budget can't bound them: they must not be read ahead."""
+    base = {f"model.layers.{i}.input_layernorm.weight": rand(256) + 1 for i in range(20)}
+    calls, at_first_check = [], []
+    real_get, real_check = qd.Store.get, qd.check_unit
+    monkeypatch.setattr(qd.Store, "get", lambda self, n: calls.append(n) or real_get(self, n))
+    monkeypatch.setattr(qd, "check_unit", lambda t, ts: at_first_check.append(len(calls)) or real_check(t, ts))
+    run(tmp_path, base, {k: v.clone() for k, v in base.items()})
+    assert at_first_check[0] == 2  # this unit's upstream and candidate tensors, nothing ahead
+
+
+def test_fp8_blocks_with_distinct_exponents_decode_per_block():
+    w = rand(256, 256).float()
+    w *= torch.exp2(torch.arange(-6, 10).float()).repeat_interleave(16)[:, None]  # every 32-row block its own scale
+    q, s, deq = fp8_block(w.to(torch.bfloat16), block=128)
+    assert s.view(torch.uint8).unique().numel() > 1
+    assert torch.equal(qd.decode_base(q, s), deq)
+
+
+def test_sampled_experts_are_named_in_the_verdict(tmp_path):
+    base, cand = deepseek_pair(n_experts=16)
+    out = qd.render(run(tmp_path, base, cand, experts=4))
+    assert "experts: 4 of 16" in out and "not a full result" in out
+
+
+def test_nan_in_a_microscaling_tensor_is_flagged_not_a_crash():
+    deq = fp8_block(rand(64, 128))[2]
+    words, scales = mx_candidate(deq, 8)
+    b = words.view(torch.uint8).clone()
+    b[0, 0] = 0x7F  # E4M3 NaN
+    res = qd.check_mx("t", deq, b.view(torch.uint32), scales)
+    assert res.flagged and "not finite" in res.reasons[0]
+
+
+def test_experts_must_be_positive():
+    with pytest.raises(SystemExit) as e:
+        qd.main(["--base", "x", "--candidate", "y", "--experts", "0"])
+    assert e.value.code == 2

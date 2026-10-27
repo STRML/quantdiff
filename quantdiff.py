@@ -83,6 +83,7 @@ class Report:
     layers: list = None  # layers checked when sampling; None means every tensor
     fetched: int = 0  # bytes streamed over HTTP (base and candidate); nothing is written to disk
     remote_total: int = 0  # bytes in the streamed repos
+    experts: list = None  # [(sampled, of)] per stacked tensor checked on a sample of its experts
 
     @property
     def verdict(self):
@@ -537,6 +538,8 @@ def check_quant(name, base_w, words, scales, biases):
         return res
     codes = unpack_codes(words, bits)
     deq = dequantize(words, scales, biases, bits, gs)
+    if not_finite(res, deq):
+        return res
     delta = deq - base_w.float()
     res.rel_err = rel(delta, base_w)
     ref_delta = requantize(base_w, bits, gs) - base_w.float()
@@ -596,7 +599,10 @@ def check_mx(name, base_w, words, scales):
     if bits not in MX_TOP or gs != 32 or gs * scales.shape[-1] != in_dim:
         res.reasons.append(f"layout does not decode as mxfp (bits={bits}, group_size={gs})")
         return res
-    delta = mx_dequantize(words, scales, bits) - base_w.float()
+    deq = mx_dequantize(words, scales, bits)
+    if not_finite(res, deq):
+        return res
+    delta = deq - base_w.float()
     ref_delta = mx_requantize(base_w, bits) - base_w.float()
     res.rel_err, floor = rel(delta, base_w), rel(ref_delta, base_w)
     # An upstream already on the format's grid (FP8 into mxfp8) round-trips exactly: no floor, and no error either.
@@ -609,12 +615,22 @@ def check_mx(name, base_w, words, scales):
     return res
 
 
+def not_finite(res, values):
+    """Flag NaN or inf in what the candidate decodes to: every comparison after it would read NaN as a pass."""
+    if torch.isfinite(values).all():
+        return False
+    res.reasons.append("values are not finite (a NaN or inf code or scale)")
+    return True
+
+
 def check_plain(name, base_w, cand_w):
     res = TensorResult(name, "plain", list(base_w.shape))
     if base_w.shape != cand_w.shape:
         res.reasons.append(f"shape {list(cand_w.shape)} against upstream {list(base_w.shape)}")
         return res
     if torch.equal(base_w, cand_w):
+        return res
+    if not_finite(res, cand_w):
         return res
     delta = cand_w.float() - base_w.float()
     res.rel_err = rel(delta, base_w)
@@ -634,7 +650,8 @@ def stream_units(units, budget, workers=8, on_submit=None):
     """Yield (unit, tensors) in order. Remote tensors are fetched ahead on a thread pool, at most `budget` bytes
     beyond the unit being checked (one request costs ~2 s of latency, so one at a time is slow)."""
     size = lambda u: sum(s.size(n) for s, n in u[1] if hasattr(s, "size"))  # noqa: E731
-    if not any(hasattr(s, "size") for u in units[:1] for s, _ in u[1]):
+    # Local stores report no sizes (the wrappers over them report 0), so a byte budget can't bound them: read in order.
+    if not units or size(units[0]) == 0:
         for u in units:
             yield u, [s.get(n) for s, n in u[1]]
         return
@@ -669,7 +686,7 @@ def audit(base, cand, only=None, layers=None, include_global=False, prefetch_byt
     quant_stems = {n[: -len(".scales")] for n in cand.names if n.endswith(".scales") and n[: -len(".scales")] + ".weight" in cand.names}
     skip = {s + suffix for s in quant_stems for suffix in (".scales", ".biases")}
     pat = re.compile(only) if only else None
-    units, only_cand, matched, fused, early = [], [], set(), None, []
+    units, only_cand, matched, fused, early, sampled = [], [], set(), None, [], []
     for name in sorted(cand.names - skip):
         stem = name[: -len(".weight")] if name.endswith(".weight") else None
         expert = match_expert(name, by_canon)
@@ -694,6 +711,8 @@ def audit(base, cand, only=None, layers=None, include_global=False, prefetch_byt
                 early.append(bad)
                 continue
             idx = pick_layers(base.experts[target], experts)
+            if len(idx) < want:
+                sampled.append((len(idx), want))
             source, shown, cand_src = (base, (target, idx)), f"{target}[experts {expert_label(idx)}]", sliced
         key = (lambda n: (n, idx)) if cand_src is sliced else (lambda n: n)
         fetch = [source, (cand_src, key(name))]
@@ -716,7 +735,7 @@ def audit(base, cand, only=None, layers=None, include_global=False, prefetch_byt
     return Report(results, only_cand, sorted(n for n in base.names - matched if in_scope(n)),
                   None if layers is None else sorted(layers, key=str),
                   sum(getattr(s, "fetched", 0) for s in (raw_base, cand)),
-                  sum(getattr(s, "total_bytes", 0) for s in (raw_base, cand)))
+                  sum(getattr(s, "total_bytes", 0) for s in (raw_base, cand)), sampled or None)
 
 
 def check_unit(target, tensors):
@@ -768,11 +787,15 @@ def describe_layers(layers):
 def render(rep, top=15):
     out = []
     flagged = sorted((t for t in rep.tensors if t.flagged), key=lambda t: -(t.ratio or t.rel_err))
-    q = [t for t in rep.tensors if t.kind == "quant"]
+    q = [t for t in rep.tensors if t.kind in ("quant", "mx")]
     out.append(f"{rep.verdict}: {len(flagged)} of {len(rep.tensors)} tensors flagged, "
                f"{len(rep.only_candidate)} not in upstream, {len(rep.only_base)} missing from candidate")
     if rep.layers is not None:
         out.append(f"sampled {describe_layers(rep.layers)} only; every other layer is unchecked, so this is not a full result")
+    if rep.experts:
+        counts = ", ".join(sorted({f"{k} of {n}" for k, n in rep.experts}))
+        out.append(f"sampled experts: {counts} in each of {len(rep.experts)} stacked tensors; every other expert is "
+                   "unchecked, so this is not a full result (--experts to widen)")
     if rep.remote_total:
         out.append(f"streamed {rep.fetched / 1e6:,.0f} MB (the streamed repos hold {rep.remote_total / 1e6:,.0f} MB), nothing written to disk")
     shifts = {}
@@ -938,6 +961,13 @@ def header_status(label):
     return say
 
 
+def positive_int(text):
+    n = int(text)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {n}")
+    return n
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--base", required=True, help="upstream model dir or HF repo id")
@@ -952,7 +982,7 @@ def main(argv=None):
     ap.add_argument("--progress", choices=["auto", "on", "off"], default="auto", help="live terminal view on stderr (auto: only when stderr is a terminal)")
     ap.add_argument("--global", dest="include_global", action="store_true", help="with --sample/--layers, also check tensors outside the layers (embeddings, lm_head, final norm)")
     ap.add_argument("--only", help="regex on upstream tensor names; others are skipped")
-    ap.add_argument("--experts", type=int, default=8, metavar="K", help="when upstream stores one tensor per expert and the pack stacks them, compare K experts spread through the stack (default 8)")
+    ap.add_argument("--experts", type=positive_int, default=8, metavar="K", help="when upstream stores one tensor per expert and the pack stacks them, compare K experts spread through the stack (default 8)")
     ap.add_argument("--json", help="write the full per-tensor report here")
     args = ap.parse_args(argv)
     try:
