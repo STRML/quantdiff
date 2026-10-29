@@ -648,6 +648,30 @@ def test_fp4_nibble_order_low_first():
     assert torch.equal(qd.decode_base(packed, scale), deq)
 
 
+def test_fp8_candidate_with_its_own_block_scale_matches_upstream(tmp_path):
+    q, s, _ = fp8_block(rand(64, 128))
+    base = {"layers.0.attn.wo.weight": q, "layers.0.attn.wo.scale": s}
+    cand = {"layers.0.attn.wo.weight": q.clone(), "layers.0.attn.wo.scale": s.clone()}
+
+    rep = run(tmp_path, base, cand)
+
+    assert rep.verdict == "NO FINDINGS", (rep.flagged_names(), rep.only_candidate, rep.only_base)
+    assert rep.only_candidate == []
+    assert rep.only_base == []
+
+
+def test_tampered_fp8_candidate_with_its_own_scale_is_flagged(tmp_path):
+    q, s, _ = fp8_block(rand(64, 128))
+    changed = q.clone()
+    changed[0, 0] = torch.tensor(0 if float(changed[0, 0]) != 0 else 1, dtype=q.dtype)
+    base = {"layers.0.attn.wo.weight": q, "layers.0.attn.wo.scale": s}
+    cand = {"layers.0.attn.wo.weight": changed, "layers.0.attn.wo.scale": s.clone()}
+
+    rep = run(tmp_path, base, cand)
+
+    assert rep.flagged_names() == ["layers.0.attn.wo.weight"]
+
+
 def test_fp8_scale_grid_padded_with_ceil_decodes(tmp_path):
     """DeepSeek-V3's converter pads the last block: a 48-row weight with 32-row blocks has 2 scale rows."""
     w = rand(48, 128)
