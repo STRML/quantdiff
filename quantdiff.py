@@ -688,8 +688,8 @@ def audit(base, cand, only=None, layers=None, include_global=False, prefetch_byt
     """`base` and `cand` are stores or directories. `layers` limits the check to those layer indices. `experts` is
     how many experts of a stacked pack tensor are compared when upstream stores one tensor per expert."""
     raw_base = base if hasattr(base, "get") else Store(base)
-    cand = cand if hasattr(cand, "get") else Store(cand)
-    base, sliced = DecodedBase(raw_base), ExpertSlice(cand)
+    raw_cand = cand if hasattr(cand, "get") else Store(cand)
+    base, sliced = DecodedBase(raw_base), ExpertSlice(DecodedBase(raw_cand))
 
     def in_scope(name):
         if layers is None:
@@ -740,7 +740,7 @@ def audit(base, cand, only=None, layers=None, include_global=False, prefetch_byt
     matched.update(v for v in base.experts if set(base.members(v)) <= matched)
     results = list(early)
     if progress:
-        progress.begin(units, (raw_base, cand), layers)
+        progress.begin(units, (raw_base, raw_cand), layers)
     for i, ((target, fetch), tensors) in enumerate(stream_units(units, prefetch_bytes, on_submit=progress and progress.submitted)):
         results.append(check_unit(target, tensors))
         if progress:
@@ -749,7 +749,7 @@ def audit(base, cand, only=None, layers=None, include_global=False, prefetch_byt
         progress.finish()
     return Report(results, only_cand, sorted(n for n in base.names - matched if in_scope(n)),
                   None if layers is None else sorted(layers, key=str),
-                  sum(getattr(s, "fetched", 0) for s in (raw_base, cand)),
+                  sum(getattr(s, "fetched", 0) for s in (raw_base, raw_cand)),
                   sum(getattr(s, "total_bytes", 0) for s in (raw_base, cand)), sampled or None)
 
 
